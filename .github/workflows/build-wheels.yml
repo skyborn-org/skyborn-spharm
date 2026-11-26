@@ -179,8 +179,15 @@ jobs:
           merge-multiple: true
       - name: Prepare dist
         run: |
-          mkdir -p dist
+          set -euo pipefail
+          mkdir -p dist pypi-dist
           find dist-artifacts -type f \( -name "*.whl" -o -name "*.tar.gz" \) -exec cp {} dist/ \;
+          find dist -maxdepth 1 -type f \( -name "*.whl" -o -name "*.tar.gz" \) -exec cp {} pypi-dist/ \;
+          wheel_count="$(find pypi-dist -type f -name '*.whl' | wc -l)"
+          sdist_count="$(find pypi-dist -type f -name '*.tar.gz' | wc -l)"
+          echo "Prepared ${wheel_count} wheels and ${sdist_count} sdist(s)"
+          test "$wheel_count" -gt 0
+          test "$sdist_count" -gt 0
           (cd dist && sha256sum * > SHA256SUMS.txt)
       - name: Upload to GitHub release
         uses: softprops/action-gh-release@v3
@@ -192,5 +199,5 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
-          packages-dir: dist
+          packages-dir: pypi-dist
+          skip-existing: true
