@@ -25,6 +25,43 @@
 
 ---
 
+## Spherical Harmonics Visual Primer: Analysis, Spectral Calculus & Synthesis
+
+### Waves on a Sphere: Orthogonal Spherical Harmonic Basis
+
+<p align="center"><img src="assets/skyborn_spharm_modes_primer.svg" alt="Spherical Harmonic Modes Primer" width="920"/></p>
+
+Just as a 1D Fourier series decomposes a signal around a circle into pure sine and cosine waves, **spherical harmonics** $Y_n^m(\theta,\lambda) = \bar{P}_n^m(\sin\theta)e^{im\lambda}$ decompose global geophysical fields (such as wind, vorticity, geopotential, and temperature) into smooth, orthogonal 2D wave patterns over the entire sphere:
+
+- **Zonal modes ($m = 0$)**: Symmetric latitude belts with no variation in longitude, capturing the pole-to-equator mean state and zonal jet bands.
+- **Tesseral modes ($0 < m < n$)**: Checkerboard wave cells across midlatitudes, capturing planetary Rossby waves and storm tracks.
+- **Sectorial modes ($m = n$)**: Orange-slice wave sectors peaking along the equator, capturing tropical wave trains and Walker-scale oscillations.
+
+Because $Y_n^m(\theta,\lambda)$ are smooth global eigenfunctions of the spherical Laplacian, spectral transforms completely eliminate the latitude-longitude **"pole problem"** caused by converging meridians and polar finite-difference singularities (Swarztrauber 1979, 1993, 1996; Adams & Swarztrauber 1999; Swarztrauber & Spotz 2000).
+
+### From Grid to Spectrum and Back: Analysis, Spectral Calculus & Synthesis
+
+<p align="center"><img src="assets/skyborn_spharm_analysis_synthesis.svg" alt="Spherical Harmonic Analysis and Synthesis" width="920"/></p>
+
+<table>
+  <tr>
+    <td width="50%" align="center" valign="top">
+      <img src="assets/skyborn_analysis_logo.svg" alt="Spherical Harmonic Analysis (Grid to Spectrum)" width="190"/><br/>
+      <strong>Analysis (Forward Transform, Grid &rarr; Spectrum)</strong><br/>
+      <code>Zonal Real FFT</code> along longitude (&lambda; &rarr; <i>m</i>) followed by <code>Gauss-Legendre Quadrature</code> along latitude (&theta; &rarr; <i>n</i>) via <code>grdtospec</code> and <code>getvrtdivspec</code>, projecting physical grids into triangularly truncated spectral coefficients <i>c<sub>n</sub><sup>m</sup></i> (0 &le; <i>m</i> &le; <i>n</i> &le; <i>N</i>).
+    </td>
+    <td width="50%" align="center" valign="top">
+      <img src="assets/skyborn_synthesis_logo.svg" alt="Spherical Harmonic Synthesis (Spectrum to Grid)" width="190"/><br/>
+      <strong>Synthesis (Inverse Transform, Spectrum &rarr; Grid)</strong><br/>
+      <code>Legendre Summation</code> across degree <i>n</i> followed by <code>Inverse Zonal FFT</code> (<i>m</i> &rarr; &lambda;) via <code>spectogrd</code>, <code>getuv</code>, and <code>getpsichi</code>, reconstructing smooth scalar fields or rotational and divergent wind components cleanly.
+    </td>
+  </tr>
+</table>
+
+- **Algebraic Spectral Calculus (`invlap` / `lap`)**: In spectral space, horizontal differentiation and Poisson inversion reduce to exact diagonal arithmetic: $\nabla^2 \leftrightarrow -n(n+1)/a^2$ and $\nabla^{-2} \leftrightarrow -\frac{a^2}{n(n+1)}$ (`lap` / `invlap`). Streamfunction $\psi$ and velocity potential $\chi$ are inverted directly from vorticity $\zeta$ and divergence $\delta$ with zero polar coordinate singularities.
+
+---
+
 ## Pure-Rust (`_spharm_rs`) vs. Legacy Fortran (`_spherepack`) Comparison
 
 All benchmarks below were measured after warmup (median wall time and physical peak `ru_maxrss` delta) on Apple Silicon (`arm64`, Python 3.14, `--release` build) using realistic `S2N` C-order inputs.
