@@ -16,10 +16,12 @@ from .spherical_harmonics import (
     SpheremackError,
     ValidationError,
     _call_backend,
+    _prepare_paired_spectral_2d,
+    _prepare_spectral_2d,
     _resolve_lat_order,
     _resolve_public_complex_dtype,
     _resolve_public_real_dtype,
-    _resolve_spectral_layout,
+    _restore_spectral_nd,
     _validate_layout,
     _validate_precision,
 )
@@ -244,43 +246,20 @@ class ReducedGaussianSpharmt:
             raise ValidationError(
                 f"{operation_name} needs at least a rank 1 spectrum, got rank {arr.ndim}"
             )
-        resolved_layout, ntrunc, batch_shape = _resolve_spectral_layout(
-            arr, self.layout, self.nlat - 1, operation_name
+        return _prepare_spectral_2d(
+            arr,
+            self.layout,
+            self.nlat - 1,
+            self.precision,
+            operation_name,
+            target_dtype=target_dtype,
         )
-        compute_dtype = (
-            self._public_complex_dtype(arr)
-            if target_dtype is None
-            else (target_dtype if type(target_dtype) is np.dtype else np.dtype(target_dtype))
-        )
-        nt = 1 if not batch_shape else math.prod(batch_shape)
-
-        if arr.ndim == 1:
-            reshaped = arr.reshape(1, arr.shape[0])
-            c_2d = (
-                reshaped
-                if reshaped.dtype == compute_dtype and reshaped.flags.c_contiguous
-                else np.ascontiguousarray(reshaped, dtype=compute_dtype)
-            )
-        elif resolved_layout == "c":
-            reshaped = arr.reshape(nt, arr.shape[-1])
-            c_2d = (
-                reshaped
-                if reshaped.dtype == compute_dtype and reshaped.flags.c_contiguous
-                else np.ascontiguousarray(reshaped, dtype=compute_dtype)
-            )
-        else:
-            c_2d = np.ascontiguousarray(
-                np.moveaxis(arr.reshape(arr.shape[0], nt), 0, -1),
-                dtype=compute_dtype,
-            )
-
-        return resolved_layout, nt, ntrunc, c_2d, batch_shape
 
     def _prepare_paired_grid_inputs(
         self, ugrid: FloatArray, vgrid: FloatArray, operation_name: str
     ) -> Tuple[str, int, FloatArray, FloatArray, Tuple[int, ...]]:
-        u_arr = np.asarray(ugrid)
-        v_arr = np.asarray(vgrid)
+        u_arr = ugrid if type(ugrid) is np.ndarray else np.asarray(ugrid)
+        v_arr = vgrid if type(vgrid) is np.ndarray else np.asarray(vgrid)
         if u_arr.shape != v_arr.shape:
             raise ValidationError("ugrid and vgrid must have the same shape")
 
@@ -298,26 +277,13 @@ class ReducedGaussianSpharmt:
     def _prepare_paired_spectral_inputs(
         self, spec_a: ComplexArray, spec_b: ComplexArray, operation_name: str
     ) -> Tuple[str, int, int, ComplexArray, ComplexArray, Tuple[int, ...]]:
-        a_arr = np.asarray(spec_a)
-        b_arr = np.asarray(spec_b)
-        if a_arr.shape != b_arr.shape:
-            raise ValidationError("paired spectra must have the same shape")
-
-        compute_dtype = self._public_complex_dtype(a_arr, b_arr)
-        layout_a, nt_a, ntrunc_a, a_2d, batch_a = self._prepare_spectral_input(
-            a_arr, operation_name, target_dtype=compute_dtype
+        return _prepare_paired_spectral_2d(
+            spec_a,
+            spec_b,
+            self._prepare_spectral_input,
+            self.precision,
+            operation_name,
         )
-        layout_b, nt_b, ntrunc_b, b_2d, batch_b = self._prepare_spectral_input(
-            b_arr, operation_name, target_dtype=compute_dtype
-        )
-        if (
-            layout_a != layout_b
-            or nt_a != nt_b
-            or ntrunc_a != ntrunc_b
-            or batch_a != batch_b
-        ):
-            raise ValidationError("paired spectra must have consistent dimensions")
-        return layout_a, nt_a, ntrunc_a, a_2d, b_2d, batch_a
 
     def _restore_grid_output(
         self,
@@ -342,14 +308,9 @@ class ReducedGaussianSpharmt:
         batch_shape: Tuple[int, ...],
         output_dtype: Optional[np.dtype] = None,
     ) -> ComplexArray:
-        array = np.asarray(spec_2d)
-        if output_dtype is not None and array.dtype != np.dtype(output_dtype):
-            array = array.astype(np.dtype(output_dtype), copy=False)
-        if not batch_shape:
-            return array[0]
-        if resolved_layout == "c":
-            return array.reshape(batch_shape + (array.shape[1],))
-        return np.moveaxis(array, 0, -1).reshape((array.shape[1],) + batch_shape)
+        return _restore_spectral_nd(
+            spec_2d, resolved_layout, batch_shape, output_dtype=output_dtype
+        )
 
     # Legacy internal adapters used by Skyborn's ReducedVectorWind (expects (npoints, nt) <-> (nmdim, nt))
     def _validate_grid_data(
@@ -433,10 +394,14 @@ class ReducedGaussianSpharmt:
         return result
 
     def _analyze_scalar(
-        self, datagrid: FloatArray, ntrunc: Optional[int] = None
+        self,
+        datagrid: FloatArray,
+        ntrunc: Optional[int] = None,
+        c_order: bool = False,
     ) -> ComplexArray:
         ntrunc = self._validate_ntrunc(ntrunc)
-        c_2d = np.ascontiguousarray(np.asarray(datagrid).T)
+        arr = np.asarray(datagrid)
+        c_2d = np.ascontiguousarray(arr if c_order else arr.T)
         spec_2d = _call_backend(
             self._core.grdtospec,
             c_2d,
@@ -444,30 +409,37 @@ class ReducedGaussianSpharmt:
             south_to_north=self.south_to_north,
             operation_name="reduced Gaussian grdtospec",
         )
-        return spec_2d.T
+        return spec_2d if c_order else spec_2d.T
 
     def _synthesize_scalar(
-        self, dataspec: ComplexArray, ntrunc: Optional[int] = None
+        self,
+        dataspec: ComplexArray,
+        ntrunc: Optional[int] = None,
+        c_order: bool = False,
     ) -> FloatArray:
         self._validate_ntrunc(ntrunc)
-        c_2d = np.ascontiguousarray(np.asarray(dataspec).T)
+        arr = np.asarray(dataspec)
+        c_2d = np.ascontiguousarray(arr if c_order else arr.T)
         grid_2d = _call_backend(
             self._core.spectogrd,
             c_2d,
             south_to_north=self.south_to_north,
             operation_name="reduced Gaussian spectogrd",
         )
-        return grid_2d.T
+        return grid_2d if c_order else grid_2d.T
 
     def _synthesize_scalar_pair(
         self,
         dataspec_a: ComplexArray,
         dataspec_b: ComplexArray,
         ntrunc: Optional[int] = None,
+        c_order: bool = False,
     ) -> Tuple[FloatArray, FloatArray]:
         self._validate_ntrunc(ntrunc)
-        a_2d = np.ascontiguousarray(np.asarray(dataspec_a).T)
-        b_2d = np.ascontiguousarray(np.asarray(dataspec_b).T)
+        arr_a = np.asarray(dataspec_a)
+        arr_b = np.asarray(dataspec_b)
+        a_2d = np.ascontiguousarray(arr_a if c_order else arr_a.T)
+        b_2d = np.ascontiguousarray(arr_b if c_order else arr_b.T)
         grid_a, grid_b = _call_backend(
             self._core.spectogrd_pair,
             a_2d,
@@ -475,17 +447,20 @@ class ReducedGaussianSpharmt:
             south_to_north=self.south_to_north,
             operation_name="reduced Gaussian paired spectogrd",
         )
-        return grid_a.T, grid_b.T
+        return (grid_a, grid_b) if c_order else (grid_a.T, grid_b.T)
 
     def _analyze_wind(
         self,
         ugrid: FloatArray,
         vgrid: FloatArray,
         ntrunc: Optional[int] = None,
+        c_order: bool = False,
     ) -> Tuple[ComplexArray, ComplexArray]:
         ntrunc = self._validate_ntrunc(ntrunc)
-        u_2d = np.ascontiguousarray(np.asarray(ugrid).T)
-        v_2d = np.ascontiguousarray(np.asarray(vgrid).T)
+        u_arr = np.asarray(ugrid)
+        v_arr = np.asarray(vgrid)
+        u_2d = np.ascontiguousarray(u_arr if c_order else u_arr.T)
+        v_2d = np.ascontiguousarray(v_arr if c_order else v_arr.T)
         vrt, div = _call_backend(
             self._core.getvrtdivspec,
             u_2d,
@@ -494,17 +469,20 @@ class ReducedGaussianSpharmt:
             south_to_north=self.south_to_north,
             operation_name="reduced Gaussian vector analysis",
         )
-        return vrt.T, div.T
+        return (vrt, div) if c_order else (vrt.T, div.T)
 
     def _analyze_vorticity(
         self,
         ugrid: FloatArray,
         vgrid: FloatArray,
         ntrunc: Optional[int] = None,
+        c_order: bool = False,
     ) -> ComplexArray:
         ntrunc = self._validate_ntrunc(ntrunc)
-        u_2d = np.ascontiguousarray(np.asarray(ugrid).T)
-        v_2d = np.ascontiguousarray(np.asarray(vgrid).T)
+        u_arr = np.asarray(ugrid)
+        v_arr = np.asarray(vgrid)
+        u_2d = np.ascontiguousarray(u_arr if c_order else u_arr.T)
+        v_2d = np.ascontiguousarray(v_arr if c_order else v_arr.T)
         vrt = _call_backend(
             self._core.getvrtspec,
             u_2d,
@@ -513,17 +491,20 @@ class ReducedGaussianSpharmt:
             south_to_north=self.south_to_north,
             operation_name="reduced Gaussian vorticity analysis",
         )
-        return vrt.T
+        return vrt if c_order else vrt.T
 
     def _analyze_divergence(
         self,
         ugrid: FloatArray,
         vgrid: FloatArray,
         ntrunc: Optional[int] = None,
+        c_order: bool = False,
     ) -> ComplexArray:
         ntrunc = self._validate_ntrunc(ntrunc)
-        u_2d = np.ascontiguousarray(np.asarray(ugrid).T)
-        v_2d = np.ascontiguousarray(np.asarray(vgrid).T)
+        u_arr = np.asarray(ugrid)
+        v_arr = np.asarray(vgrid)
+        u_2d = np.ascontiguousarray(u_arr if c_order else u_arr.T)
+        v_2d = np.ascontiguousarray(v_arr if c_order else v_arr.T)
         div = _call_backend(
             self._core.getdivspec,
             u_2d,
@@ -532,30 +513,37 @@ class ReducedGaussianSpharmt:
             south_to_north=self.south_to_north,
             operation_name="reduced Gaussian divergence analysis",
         )
-        return div.T
+        return div if c_order else div.T
 
     def _synthesize_gradient(
-        self, dataspec: ComplexArray, ntrunc: Optional[int] = None
+        self,
+        dataspec: ComplexArray,
+        ntrunc: Optional[int] = None,
+        c_order: bool = False,
     ) -> Tuple[FloatArray, FloatArray]:
         self._validate_ntrunc(ntrunc)
-        c_2d = np.ascontiguousarray(np.asarray(dataspec).T)
+        arr = np.asarray(dataspec)
+        c_2d = np.ascontiguousarray(arr if c_order else arr.T)
         ugrad, vgrad = _call_backend(
             self._core.getgrad,
             c_2d,
             south_to_north=self.south_to_north,
             operation_name="reduced Gaussian gradient synthesis",
         )
-        return ugrad.T, vgrad.T
+        return (ugrad, vgrad) if c_order else (ugrad.T, vgrad.T)
 
     def _synthesize_gradient_pair(
         self,
         dataspec_a: ComplexArray,
         dataspec_b: ComplexArray,
         ntrunc: Optional[int] = None,
+        c_order: bool = False,
     ) -> Tuple[FloatArray, FloatArray, FloatArray, FloatArray]:
         self._validate_ntrunc(ntrunc)
-        a_2d = np.ascontiguousarray(np.asarray(dataspec_a).T)
-        b_2d = np.ascontiguousarray(np.asarray(dataspec_b).T)
+        arr_a = np.asarray(dataspec_a)
+        arr_b = np.asarray(dataspec_b)
+        a_2d = np.ascontiguousarray(arr_a if c_order else arr_a.T)
+        b_2d = np.ascontiguousarray(arr_b if c_order else arr_b.T)
         au, av, bu, bv = _call_backend(
             self._core.getgrad_pair,
             a_2d,
@@ -563,17 +551,20 @@ class ReducedGaussianSpharmt:
             south_to_north=self.south_to_north,
             operation_name="reduced Gaussian paired gradient synthesis",
         )
-        return au.T, av.T, bu.T, bv.T
+        return (au, av, bu, bv) if c_order else (au.T, av.T, bu.T, bv.T)
 
-    def _invlap(self, dataspec: ComplexArray) -> ComplexArray:
-        c_2d = np.ascontiguousarray(np.asarray(dataspec).T)
+    def _invlap(
+        self, dataspec: ComplexArray, c_order: bool = False
+    ) -> ComplexArray:
+        arr = np.asarray(dataspec)
+        c_2d = np.ascontiguousarray(arr if c_order else arr.T)
         inv = _call_backend(
             _spharm_rs.invlap,
             c_2d,
             self.rsphere,
             operation_name="reduced Gaussian invlap",
         )
-        return inv.T
+        return inv if c_order else inv.T
 
     # Public API
     def grdtospec(
@@ -853,46 +844,174 @@ class ReducedGaussianSpharmt:
         """Apply the inverse spherical Laplacian to spectral coefficients."""
         return self._invlapspec(dataspec, "invlap")
 
+    def _psichi_spec_2d(
+        self,
+        ugrid: FloatArray,
+        vgrid: FloatArray,
+        ntrunc: Optional[int],
+        component: Optional[str],
+        operation_name: str,
+    ):
+        """Analyze winds and apply inverse Laplacian directly in 2D (nt, nmdim)."""
+        resolved_layout, nt, u_2d, v_2d, batch_shape = self._prepare_paired_grid_inputs(
+            ugrid, vgrid, operation_name
+        )
+        ntrunc = self._validate_ntrunc(ntrunc)
+        if nt == 0:
+            nmdim = (ntrunc + 1) * (ntrunc + 2) // 2
+            cdtype = np.dtype(
+                np.complex128 if u_2d.dtype == np.float64 else np.complex64
+            )
+            empty = np.empty((0, nmdim), dtype=cdtype)
+            if component is None:
+                return resolved_layout, nt, (empty, empty.copy()), batch_shape
+            return resolved_layout, nt, empty, batch_shape
+
+        if component is None:
+            vrt_2d, div_2d = _call_backend(
+                self._core.getvrtdivspec,
+                u_2d,
+                v_2d,
+                ntrunc=ntrunc,
+                south_to_north=self.south_to_north,
+                operation_name=f"{operation_name} vector analysis",
+            )
+            psi_2d = _call_backend(
+                _spharm_rs.invlap,
+                vrt_2d,
+                self.rsphere,
+                operation_name="reduced Gaussian invlap",
+            )
+            chi_2d = _call_backend(
+                _spharm_rs.invlap,
+                div_2d,
+                self.rsphere,
+                operation_name="reduced Gaussian invlap",
+            )
+            return resolved_layout, nt, (psi_2d, chi_2d), batch_shape
+
+        core_fn = self._core.getvrtspec if component == "psi" else self._core.getdivspec
+        spec_2d = _call_backend(
+            core_fn,
+            u_2d,
+            v_2d,
+            ntrunc=ntrunc,
+            south_to_north=self.south_to_north,
+            operation_name=f"{operation_name} analysis",
+        )
+        inv_2d = _call_backend(
+            _spharm_rs.invlap,
+            spec_2d,
+            self.rsphere,
+            operation_name="reduced Gaussian invlap",
+        )
+        return resolved_layout, nt, inv_2d, batch_shape
+
     def getpsispec(
         self, ugrid: FloatArray, vgrid: FloatArray, ntrunc: Optional[int] = None
     ) -> ComplexArray:
         """Compute streamfunction spectral coefficients from packed winds."""
-        return self._invlapspec(self.getvrtspec(ugrid, vgrid, ntrunc), "getpsispec")
+        resolved_layout, _, psi_2d, batch_shape = self._psichi_spec_2d(
+            ugrid, vgrid, ntrunc, "psi", "getpsispec"
+        )
+        return self._restore_spectral_output(psi_2d, resolved_layout, batch_shape)
 
     def getchispec(
         self, ugrid: FloatArray, vgrid: FloatArray, ntrunc: Optional[int] = None
     ) -> ComplexArray:
         """Compute velocity-potential spectral coefficients from packed winds."""
-        return self._invlapspec(self.getdivspec(ugrid, vgrid, ntrunc), "getchispec")
+        resolved_layout, _, chi_2d, batch_shape = self._psichi_spec_2d(
+            ugrid, vgrid, ntrunc, "chi", "getchispec"
+        )
+        return self._restore_spectral_output(chi_2d, resolved_layout, batch_shape)
 
     def getpsichispec(
         self, ugrid: FloatArray, vgrid: FloatArray, ntrunc: Optional[int] = None
     ) -> Tuple[ComplexArray, ComplexArray]:
         """Compute streamfunction and velocity-potential spectra from packed winds."""
-        vrtspec, divspec = self.getvrtdivspec(ugrid, vgrid, ntrunc)
+        resolved_layout, _, (psi_2d, chi_2d), batch_shape = self._psichi_spec_2d(
+            ugrid, vgrid, ntrunc, None, "getpsichispec"
+        )
         return (
-            self._invlapspec(vrtspec, "getpsichispec"),
-            self._invlapspec(divspec, "getpsichispec"),
+            self._restore_spectral_output(psi_2d, resolved_layout, batch_shape),
+            self._restore_spectral_output(chi_2d, resolved_layout, batch_shape),
         )
 
     def getpsi(
         self, ugrid: FloatArray, vgrid: FloatArray, ntrunc: Optional[int] = None
     ) -> FloatArray:
         """Compute streamfunction from packed winds without materializing chi."""
-        return self.spectogrd(self.getpsispec(ugrid, vgrid, ntrunc))
+        resolved_layout, nt, psi_2d, batch_shape = self._psichi_spec_2d(
+            ugrid, vgrid, ntrunc, "psi", "getpsi"
+        )
+        if nt == 0:
+            rdtype = np.dtype(
+                np.float64 if psi_2d.dtype == np.complex128 else np.float32
+            )
+            return self._restore_grid_output(
+                np.empty((0, self.npoints), dtype=rdtype),
+                resolved_layout,
+                batch_shape,
+            )
+        grid_2d = _call_backend(
+            self._core.spectogrd,
+            psi_2d,
+            south_to_north=self.south_to_north,
+            operation_name="reduced Gaussian spectogrd",
+        )
+        return self._restore_grid_output(grid_2d, resolved_layout, batch_shape)
 
     def getchi(
         self, ugrid: FloatArray, vgrid: FloatArray, ntrunc: Optional[int] = None
     ) -> FloatArray:
         """Compute velocity potential from packed winds without materializing psi."""
-        return self.spectogrd(self.getchispec(ugrid, vgrid, ntrunc))
+        resolved_layout, nt, chi_2d, batch_shape = self._psichi_spec_2d(
+            ugrid, vgrid, ntrunc, "chi", "getchi"
+        )
+        if nt == 0:
+            rdtype = np.dtype(
+                np.float64 if chi_2d.dtype == np.complex128 else np.float32
+            )
+            return self._restore_grid_output(
+                np.empty((0, self.npoints), dtype=rdtype),
+                resolved_layout,
+                batch_shape,
+            )
+        grid_2d = _call_backend(
+            self._core.spectogrd,
+            chi_2d,
+            south_to_north=self.south_to_north,
+            operation_name="reduced Gaussian spectogrd",
+        )
+        return self._restore_grid_output(grid_2d, resolved_layout, batch_shape)
 
     def getpsichi(
         self, ugrid: FloatArray, vgrid: FloatArray, ntrunc: Optional[int] = None
     ) -> Tuple[FloatArray, FloatArray]:
         """Compute streamfunction and velocity potential from packed winds."""
-        psispec, chispec = self.getpsichispec(ugrid, vgrid, ntrunc)
-        return self._spectogrd_pair(psispec, chispec)
+        resolved_layout, nt, (psi_2d, chi_2d), batch_shape = self._psichi_spec_2d(
+            ugrid, vgrid, ntrunc, None, "getpsichi"
+        )
+        if nt == 0:
+            rdtype = np.dtype(
+                np.float64 if psi_2d.dtype == np.complex128 else np.float32
+            )
+            empty = np.empty((0, self.npoints), dtype=rdtype)
+            return (
+                self._restore_grid_output(empty, resolved_layout, batch_shape),
+                self._restore_grid_output(empty.copy(), resolved_layout, batch_shape),
+            )
+        psi_grid, chi_grid = _call_backend(
+            self._core.spectogrd_pair,
+            psi_2d,
+            chi_2d,
+            south_to_north=self.south_to_north,
+            operation_name="reduced Gaussian paired spectogrd",
+        )
+        return (
+            self._restore_grid_output(psi_grid, resolved_layout, batch_shape),
+            self._restore_grid_output(chi_grid, resolved_layout, batch_shape),
+        )
 
     def specsmooth(self, datagrid: FloatArray, smooth: FloatArray) -> FloatArray:
         """Apply latitude-dependent spectral smoothing to a packed scalar field."""

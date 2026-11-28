@@ -340,6 +340,101 @@ def _resolve_spectral_layout(
     )
 
 
+def _restore_spectral_nd(
+    spec_2d: ComplexArray,
+    resolved_layout: str,
+    batch_shape: Tuple[int, ...],
+    output_dtype: Optional[np.dtype] = None,
+) -> ComplexArray:
+    """Restore (nt, nmdim) spectral coefficients to caller's shape and dtype."""
+    array = np.asarray(spec_2d)
+    if output_dtype is not None and array.dtype != np.dtype(output_dtype):
+        array = array.astype(np.dtype(output_dtype), copy=False)
+    if not batch_shape:
+        return array[0]
+    if resolved_layout == "c":
+        return array.reshape(batch_shape + (array.shape[1],))
+    return np.moveaxis(array, 0, -1).reshape((array.shape[1],) + batch_shape)
+
+
+def _prepare_spectral_2d(
+    data: ComplexArray,
+    layout: str,
+    max_ntrunc: int,
+    precision: str,
+    operation_name: str,
+    target_dtype: Optional[np.dtype] = None,
+) -> Tuple[str, int, int, ComplexArray, Tuple[int, ...]]:
+    """Validate and normalize spectral input to C-contiguous (nt, nmdim)."""
+    arr = data if type(data) is np.ndarray else np.asarray(data)
+    resolved_layout, ntrunc, batch_shape = _resolve_spectral_layout(
+        arr, layout, max_ntrunc, operation_name
+    )
+    compute_dtype = (
+        _resolve_public_complex_dtype(precision, arr)
+        if target_dtype is None
+        else (
+            target_dtype if type(target_dtype) is np.dtype else np.dtype(target_dtype)
+        )
+    )
+    nt = 1 if not batch_shape else math.prod(batch_shape)
+
+    if arr.ndim == 1:
+        reshaped = arr.reshape(1, arr.shape[0])
+        c_2d = (
+            reshaped
+            if reshaped.dtype == compute_dtype and reshaped.flags.c_contiguous
+            else np.ascontiguousarray(reshaped, dtype=compute_dtype)
+        )
+    elif resolved_layout == "c":
+        reshaped = arr.reshape(nt, arr.shape[-1])
+        c_2d = (
+            reshaped
+            if reshaped.dtype == compute_dtype and reshaped.flags.c_contiguous
+            else np.ascontiguousarray(reshaped, dtype=compute_dtype)
+        )
+    else:
+        c_2d = np.ascontiguousarray(
+            np.moveaxis(arr.reshape(arr.shape[0], nt), 0, -1),
+            dtype=compute_dtype,
+        )
+
+    return resolved_layout, nt, ntrunc, c_2d, batch_shape
+
+
+def _prepare_paired_spectral_2d(
+    spec_a: ComplexArray,
+    spec_b: ComplexArray,
+    prepare_single: Callable[
+        [ComplexArray, str, Optional[np.dtype]],
+        Tuple[str, int, int, ComplexArray, Tuple[int, ...]],
+    ],
+    precision: str,
+    operation_name: str,
+) -> Tuple[str, int, int, ComplexArray, ComplexArray, Tuple[int, ...]]:
+    """Validate and normalize paired spectra with shared compute dtype."""
+    a_arr = spec_a if type(spec_a) is np.ndarray else np.asarray(spec_a)
+    b_arr = spec_b if type(spec_b) is np.ndarray else np.asarray(spec_b)
+    if a_arr.shape != b_arr.shape:
+        raise ValidationError("paired spectra must have the same shape")
+
+    compute_dtype = _resolve_public_complex_dtype(precision, a_arr, b_arr)
+    layout_a, nt_a, ntrunc_a, a_2d, batch_a = prepare_single(
+        a_arr, operation_name, compute_dtype
+    )
+    layout_b, nt_b, ntrunc_b, b_2d, batch_b = prepare_single(
+        b_arr, operation_name, compute_dtype
+    )
+    if (
+        layout_a != layout_b
+        or nt_a != nt_b
+        or ntrunc_a != ntrunc_b
+        or batch_a != batch_b
+    ):
+        raise ValidationError("paired spectra must have consistent dimensions")
+    return layout_a, nt_a, ntrunc_a, a_2d, b_2d, batch_a
+
+
 def _call_backend(func: Callable[..., Any], *args: Any, operation_name: str, **kwargs: Any) -> Any:
     """Invoke a Rust backend function, wrapping unexpected errors as SpheremackError."""
     try:
@@ -571,45 +666,21 @@ class Spharmt:
         target_dtype: Optional[np.dtype] = None,
     ) -> Tuple[str, int, int, ComplexArray, Tuple[int, ...]]:
         """Normalize spectral input to C-contiguous (nt, nmdim)."""
-        arr = data if type(data) is np.ndarray else np.asarray(data)
-        resolved_layout, ntrunc, batch_shape = _resolve_spectral_layout(
-            arr, getattr(self, "layout", "auto"), self.nlat - 1, operation_name
+        return _prepare_spectral_2d(
+            data,
+            getattr(self, "layout", "auto"),
+            self.nlat - 1,
+            getattr(self, "precision", "auto"),
+            operation_name,
+            target_dtype=target_dtype,
         )
-        compute_dtype = (
-            self._public_complex_dtype(arr)
-            if target_dtype is None
-            else (target_dtype if type(target_dtype) is np.dtype else np.dtype(target_dtype))
-        )
-        nt = 1 if not batch_shape else math.prod(batch_shape)
-
-        if arr.ndim == 1:
-            reshaped = arr.reshape(1, arr.shape[0])
-            c_2d = (
-                reshaped
-                if reshaped.dtype == compute_dtype and reshaped.flags.c_contiguous
-                else np.ascontiguousarray(reshaped, dtype=compute_dtype)
-            )
-        elif resolved_layout == "c":
-            reshaped = arr.reshape(nt, arr.shape[-1])
-            c_2d = (
-                reshaped
-                if reshaped.dtype == compute_dtype and reshaped.flags.c_contiguous
-                else np.ascontiguousarray(reshaped, dtype=compute_dtype)
-            )
-        else:
-            c_2d = np.ascontiguousarray(
-                np.moveaxis(arr.reshape(arr.shape[0], nt), 0, -1),
-                dtype=compute_dtype,
-            )
-
-        return resolved_layout, nt, ntrunc, c_2d, batch_shape
 
     def _prepare_paired_grid_inputs(
         self, ugrid: FloatArray, vgrid: FloatArray, operation_name: str
     ) -> Tuple[str, int, FloatArray, FloatArray, Tuple[int, ...]]:
         """Validate and normalize a pair of grid arrays with shared compute dtype."""
-        u_arr = np.asarray(ugrid)
-        v_arr = np.asarray(vgrid)
+        u_arr = ugrid if type(ugrid) is np.ndarray else np.asarray(ugrid)
+        v_arr = vgrid if type(vgrid) is np.ndarray else np.asarray(vgrid)
         if u_arr.shape != v_arr.shape:
             raise ValidationError("ugrid and vgrid must have the same shape")
 
@@ -628,26 +699,13 @@ class Spharmt:
         self, spec_a: ComplexArray, spec_b: ComplexArray, operation_name: str
     ) -> Tuple[str, int, int, ComplexArray, ComplexArray, Tuple[int, ...]]:
         """Validate and normalize a pair of spectral arrays with shared compute dtype."""
-        a_arr = np.asarray(spec_a)
-        b_arr = np.asarray(spec_b)
-        if a_arr.shape != b_arr.shape:
-            raise ValidationError("paired spectra must have the same shape")
-
-        compute_dtype = self._public_complex_dtype(a_arr, b_arr)
-        layout_a, nt_a, ntrunc_a, a_2d, batch_a = self._prepare_spectral_input(
-            a_arr, operation_name, target_dtype=compute_dtype
+        return _prepare_paired_spectral_2d(
+            spec_a,
+            spec_b,
+            self._prepare_spectral_input,
+            getattr(self, "precision", "auto"),
+            operation_name,
         )
-        layout_b, nt_b, ntrunc_b, b_2d, batch_b = self._prepare_spectral_input(
-            b_arr, operation_name, target_dtype=compute_dtype
-        )
-        if (
-            layout_a != layout_b
-            or nt_a != nt_b
-            or ntrunc_a != ntrunc_b
-            or batch_a != batch_b
-        ):
-            raise ValidationError("paired spectra must have consistent dimensions")
-        return layout_a, nt_a, ntrunc_a, a_2d, b_2d, batch_a
 
     def _restore_grid_output(
         self,
@@ -674,14 +732,9 @@ class Spharmt:
         output_dtype: Optional[np.dtype] = None,
     ) -> ComplexArray:
         """Restore (nt, nmdim) Rust output to caller's shape and dtype."""
-        array = np.asarray(spec_2d)
-        if output_dtype is not None and array.dtype != np.dtype(output_dtype):
-            array = array.astype(np.dtype(output_dtype), copy=False)
-        if not batch_shape:
-            return array[0]
-        if resolved_layout == "c":
-            return array.reshape(batch_shape + (array.shape[1],))
-        return np.moveaxis(array, 0, -1).reshape((array.shape[1],) + batch_shape)
+        return _restore_spectral_nd(
+            spec_2d, resolved_layout, batch_shape, output_dtype=output_dtype
+        )
 
     def _validate_ntrunc(self, ntrunc: Optional[int], max_allowed: int) -> int:
         """Validate and return appropriate ntrunc value."""
@@ -1021,10 +1074,40 @@ class Spharmt:
         operation_name: str,
     ) -> FloatArray:
         """Compute one streamfunction or velocity-potential grid component."""
-        fieldspec = self.getpsichi_spec_component(
-            ugrid, vgrid, ntrunc, component, operation_name
+        if component not in ("psi", "chi"):
+            raise ValidationError(
+                f'{operation_name} invalid component "{component}"; expected "psi" or "chi"'
+            )
+        resolved_layout, nt, u_3d, v_3d, batch_shape = self._prepare_paired_grid_inputs(
+            ugrid, vgrid, operation_name
         )
-        return self.spectogrd(fieldspec)
+        ntrunc = self._validate_ntrunc(ntrunc, self.nlat - 1)
+        if nt == 0:
+            empty = np.empty((0, self.nlat, self.nlon), dtype=u_3d.dtype)
+            return self._restore_grid_output(empty, resolved_layout, batch_shape)
+
+        core_fn = self._core.getvrtspec if component == "psi" else self._core.getdivspec
+        spec_2d = _call_backend(
+            core_fn,
+            u_3d,
+            v_3d,
+            ntrunc=ntrunc,
+            south_to_north=self.south_to_north,
+            operation_name=f"{operation_name} analysis",
+        )
+        invlap_2d = _call_backend(
+            _spharm_rs.invlap,
+            spec_2d,
+            self.rsphere,
+            operation_name=operation_name,
+        )
+        grid_3d = _call_backend(
+            self._core.spectogrd,
+            invlap_2d,
+            south_to_north=self.south_to_north,
+            operation_name=f"{operation_name} spectogrd",
+        )
+        return self._restore_grid_output(grid_3d, resolved_layout, batch_shape)
 
     def getpsichi_spec_component(
         self,
@@ -1066,14 +1149,49 @@ class Spharmt:
         self, ugrid: FloatArray, vgrid: FloatArray, ntrunc: Optional[int] = None
     ) -> Tuple[ComplexArray, ComplexArray]:
         """Compute streamfunction and velocity-potential spectra."""
-        vrtspec, divspec = self.getvrtdivspec(ugrid, vgrid, ntrunc)
-        if np.shape(vrtspec) != np.shape(divspec):
-            raise ValidationError(
-                "vorticity and divergence spectra have inconsistent dimensions"
+        if "getvrtdivspec" in self.__dict__:
+            vrtspec, divspec = self.getvrtdivspec(ugrid, vgrid, ntrunc)
+            if np.shape(vrtspec) != np.shape(divspec):
+                raise ValidationError(
+                    "vorticity and divergence spectra have inconsistent dimensions"
+                )
+            return (
+                self._invlapspec(vrtspec, "getpsichispec"),
+                self._invlapspec(divspec, "getpsichispec"),
             )
+
+        resolved_layout, nt, u_3d, v_3d, batch_shape = self._prepare_paired_grid_inputs(
+            ugrid, vgrid, "getpsichispec"
+        )
+        ntrunc = self._validate_ntrunc(ntrunc, self.nlat - 1)
+        if nt == 0:
+            nmdim = (ntrunc + 1) * (ntrunc + 2) // 2
+            cdtype = np.dtype(
+                np.complex128 if u_3d.dtype == np.float64 else np.complex64
+            )
+            empty = np.empty((0, nmdim), dtype=cdtype)
+            return (
+                self._restore_spectral_output(empty, resolved_layout, batch_shape),
+                self._restore_spectral_output(empty.copy(), resolved_layout, batch_shape),
+            )
+
+        vrt_2d, div_2d = _call_backend(
+            self._core.getvrtdivspec,
+            u_3d,
+            v_3d,
+            ntrunc=ntrunc,
+            south_to_north=self.south_to_north,
+            operation_name="getpsichispec transform",
+        )
+        psi_2d = _call_backend(
+            _spharm_rs.invlap, vrt_2d, self.rsphere, operation_name="invlap"
+        )
+        chi_2d = _call_backend(
+            _spharm_rs.invlap, div_2d, self.rsphere, operation_name="invlap"
+        )
         return (
-            self._invlapspec(vrtspec, "getpsichispec"),
-            self._invlapspec(divspec, "getpsichispec"),
+            self._restore_spectral_output(psi_2d, resolved_layout, batch_shape),
+            self._restore_spectral_output(chi_2d, resolved_layout, batch_shape),
         )
 
     def getpsi(
@@ -1281,50 +1399,21 @@ def invlap(
         raise ValidationError(f"rsphere must be positive, got {rsphere}")
 
     norm_layout = _validate_layout(layout)
-    arr = dataspec if type(dataspec) is np.ndarray else np.asarray(dataspec)
-    resolved_layout, _, batch_shape = _resolve_spectral_layout(
-        arr, norm_layout, sys.maxsize, "invlap"
+    resolved_layout, nt, _, c_2d, batch_shape = _prepare_spectral_2d(
+        dataspec, norm_layout, sys.maxsize, "auto", "invlap"
     )
-    compute_dtype = _resolve_public_complex_dtype("auto", arr)
-    nt = 1 if not batch_shape else math.prod(batch_shape)
-
-    if arr.ndim == 1:
-        reshaped = arr.reshape(1, arr.shape[0])
-        c_2d = (
-            reshaped
-            if reshaped.dtype == compute_dtype and reshaped.flags.c_contiguous
-            else np.ascontiguousarray(reshaped, dtype=compute_dtype)
-        )
-    elif resolved_layout == "c":
-        reshaped = arr.reshape(nt, arr.shape[-1])
-        c_2d = (
-            reshaped
-            if reshaped.dtype == compute_dtype and reshaped.flags.c_contiguous
-            else np.ascontiguousarray(reshaped, dtype=compute_dtype)
-        )
-    else:
-        c_2d = np.ascontiguousarray(
-            np.moveaxis(arr.reshape(arr.shape[0], nt), 0, -1),
-            dtype=compute_dtype,
-        )
 
     if nt == 0:
         out_2d = c_2d.copy()
     else:
-        out_2d = np.asarray(
-            _call_backend(
-                _spharm_rs.invlap,
-                c_2d,
-                rsphere_val,
-                operation_name="invlap",
-            )
+        out_2d = _call_backend(
+            _spharm_rs.invlap,
+            c_2d,
+            rsphere_val,
+            operation_name="invlap",
         )
 
-    if not batch_shape:
-        return out_2d[0]
-    if resolved_layout == "c":
-        return out_2d.reshape(batch_shape + (out_2d.shape[1],))
-    return np.moveaxis(out_2d, 0, -1).reshape((out_2d.shape[1],) + batch_shape)
+    return _restore_spectral_nd(out_2d, resolved_layout, batch_shape)
 
 
 def gaussian_lats_wts(nlat: int) -> Tuple[FloatArray, FloatArray]:

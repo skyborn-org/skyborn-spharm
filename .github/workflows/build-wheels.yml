@@ -25,7 +25,6 @@ jobs:
       matrix:
         buildplat:
           - [ubuntu-latest, manylinux_x86_64]
-          - [ubuntu-latest, manylinux2014_x86_64]
           - [macos-15-intel, macosx_x86_64]
           - [macos-15, macosx_arm64]
           - [windows-2022, win_amd64]
@@ -34,54 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Setup macOS GCC
-        if: startsWith(matrix.buildplat[0], 'macos')
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          brew list gcc >/dev/null 2>&1 || brew install gcc
-          GCC_BIN_DIR="$(brew --prefix gcc)/bin"
-          echo "${GCC_BIN_DIR}" >> "$GITHUB_PATH"
-          echo "MACOS_CC=$(compgen -G "${GCC_BIN_DIR}/gcc-[0-9]*" | sort -V | tail -1)" >> "$GITHUB_ENV"
-          echo "MACOS_CXX=$(compgen -G "${GCC_BIN_DIR}/g++-[0-9]*" | sort -V | tail -1)" >> "$GITHUB_ENV"
-          F_BIN="$(compgen -G "${GCC_BIN_DIR}/gfortran-[0-9]*" | sort -V | tail -1)"
-          echo "MACOS_FC=${F_BIN}" >> "$GITHUB_ENV"
-          echo "MACOSX_DEPLOYMENT_TARGET=15.0" >> "$GITHUB_ENV"
-
-      - name: Setup Windows MSYS2
-        if: matrix.buildplat[1] == 'win_amd64'
-        uses: msys2/setup-msys2@v2
+      - name: Setup Rust toolchain (macOS / Windows)
+        if: matrix.buildplat[1] != 'manylinux_x86_64'
+        uses: dtolnay/rust-toolchain@stable
         with:
-          update: true
-          install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-gcc-fortran
-            mingw-w64-x86_64-libgomp
-            mingw-w64-x86_64-pkgconf
-
-      - name: Setup Windows toolchain
-        if: matrix.buildplat[1] == 'win_amd64'
-        shell: pwsh
-        run: |
-          function Resolve-MsysTool([string]$name) {
-            foreach ($base in @("$env:RUNNER_TEMP\msys64\mingw64\bin", "D:\a\_temp\msys64\mingw64\bin", "C:\msys64\mingw64\bin")) {
-              $p = Join-Path $base "$name.exe"
-              if (Test-Path $p) { return (Resolve-Path $p).Path }
-            }
-            throw "Could not resolve MSYS2 tool: $name.exe"
-          }
-          $gcc = Resolve-MsysTool "gcc"
-          $gxx = Resolve-MsysTool "g++"
-          $gfortran = Resolve-MsysTool "gfortran"
-          $pkgConfig = Resolve-MsysTool "pkg-config"
-          $mingwBin = Split-Path $gcc -Parent
-          $mingwBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "MSYS2_CC=$($gcc -replace '\\','/')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "MSYS2_CXX=$($gxx -replace '\\','/')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "MSYS2_FC=$($gfortran -replace '\\','/')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "MSYS2_PKG_CONFIG=$($pkgConfig -replace '\\','/')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          pip install delvewheel
+          targets: ${{ matrix.buildplat[1] == 'macosx_x86_64' && 'x86_64-apple-darwin' || '' }}
 
       - name: Build wheels (Windows)
         if: matrix.buildplat[1] == 'win_amd64'
@@ -91,10 +47,7 @@ jobs:
         env:
           CIBW_BUILD: ${{ matrix.python }}-${{ matrix.buildplat[1] }}
           CIBW_SKIP: "*-win32 *-musllinux*"
-          CIBW_BEFORE_BUILD_WINDOWS: pip install meson ninja
-          CIBW_ENVIRONMENT_WINDOWS: CC=${{ env.MSYS2_CC }} CXX=${{ env.MSYS2_CXX }} FC=${{ env.MSYS2_FC }} F77=${{ env.MSYS2_FC }} F90=${{ env.MSYS2_FC }} PKG_CONFIG=${{ env.MSYS2_PKG_CONFIG }}
-          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: delvewheel repair -w {dest_dir} {wheel}
-          CIBW_TEST_COMMAND: python -c "from skybornspharm import Spharmt, ReducedGaussianSpharmt; print('skyborn-spharm ok')"
+          CIBW_TEST_COMMAND: python -B -c "from skybornspharm import Spharmt, ReducedGaussianSpharmt, SpharmTransform, invlap; print('skyborn-spharm ok')"
 
       - name: Build wheels (macOS)
         if: startsWith(matrix.buildplat[1], 'macosx')
@@ -104,10 +57,9 @@ jobs:
         env:
           CIBW_BUILD: ${{ matrix.python }}-${{ matrix.buildplat[1] }}
           CIBW_SKIP: "*-win32 *-musllinux*"
-          CIBW_BEFORE_BUILD: python -m pip install meson ninja
-          CIBW_ENVIRONMENT_MACOS: FC=${{ env.MACOS_FC }} F77=${{ env.MACOS_FC }} F90=${{ env.MACOS_FC }} CC=${{ env.MACOS_CC }} CXX=${{ env.MACOS_CXX }} MACOSX_DEPLOYMENT_TARGET=${{ env.MACOSX_DEPLOYMENT_TARGET }}
-          MACOSX_DEPLOYMENT_TARGET: ${{ env.MACOSX_DEPLOYMENT_TARGET }}
-          CIBW_TEST_COMMAND: python -c "from skybornspharm import Spharmt, ReducedGaussianSpharmt; print('skyborn-spharm ok')"
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET="11.0"
+          CIBW_TEST_COMMAND: python -B -c "from skybornspharm import Spharmt, ReducedGaussianSpharmt, SpharmTransform, invlap; print('skyborn-spharm ok')"
 
       - name: Build wheels (Linux manylinux_2_28)
         if: matrix.buildplat[1] == 'manylinux_x86_64'
@@ -118,24 +70,9 @@ jobs:
           CIBW_BUILD: ${{ matrix.python }}-${{ matrix.buildplat[1] }}
           CIBW_SKIP: "*-win32 *-musllinux*"
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
-          CIBW_BEFORE_BUILD_LINUX: dnf install -y gcc-gfortran || yum install -y gcc-gfortran
-          CIBW_ENVIRONMENT_LINUX: FC=gfortran CC=gcc
-          CIBW_TEST_COMMAND: python -c "from skybornspharm import Spharmt, ReducedGaussianSpharmt; print('skyborn-spharm ok')"
-
-      - name: Build wheels (Linux manylinux2014)
-        if: matrix.buildplat[1] == 'manylinux2014_x86_64'
-        uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2.1
-        with:
-          output-dir: wheelhouse
-        env:
-          CIBW_BUILD: ${{ matrix.python }}-manylinux_x86_64
-          CIBW_SKIP: "*-win32 *-musllinux*"
-          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
-          CIBW_BEFORE_BUILD_LINUX: |
-            yum install -y gcc-gfortran
-            echo "numpy<2.4.5" > /tmp/constraints.txt
-          CIBW_ENVIRONMENT_LINUX: FC=gfortran CC=gcc PIP_CONSTRAINT=/tmp/constraints.txt
-          CIBW_TEST_SKIP: "*"
+          CIBW_BEFORE_ALL_LINUX: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          CIBW_ENVIRONMENT_LINUX: PATH="/root/.cargo/bin:$PATH"
+          CIBW_TEST_COMMAND: python -B -c "from skybornspharm import Spharmt, ReducedGaussianSpharmt, SpharmTransform, invlap; print('skyborn-spharm ok')"
 
       - uses: actions/upload-artifact@v7
         with:

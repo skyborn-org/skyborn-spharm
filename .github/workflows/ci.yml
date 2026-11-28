@@ -20,30 +20,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Fortran compiler (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gfortran libgomp1 pkg-config
-
-      - name: Install Fortran compiler (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          brew list gcc >/dev/null 2>&1 || brew install gcc
-          GCC_BIN_DIR="$(brew --prefix gcc)/bin"
-          echo "${GCC_BIN_DIR}" >> "$GITHUB_PATH"
-          echo "CC=$(compgen -G "${GCC_BIN_DIR}/gcc-[0-9]*" | sort -V | tail -1)" >> "$GITHUB_ENV"
-          echo "FC=$(compgen -G "${GCC_BIN_DIR}/gfortran-[0-9]*" | sort -V | tail -1)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Run Rust unit tests
+        if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        run: cargo test --release --manifest-path rust/spharm-core/Cargo.toml
+
       - name: Install dependencies and build
         run: |
-          python -m pip install --upgrade pip setuptools wheel meson ninja numpy
-          pip install --no-build-isolation -e ".[dev]"
+          python -m pip install --upgrade pip maturin numpy pytest matplotlib pandas xarray
+          pip install --no-build-isolation --no-compile -e .
 
       - name: Run pytest
         run: python -B -m pytest -o addopts= -p no:cacheprovider -q
