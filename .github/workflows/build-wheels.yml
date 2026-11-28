@@ -25,23 +25,24 @@ jobs:
       matrix:
         buildplat:
           - [ubuntu-latest, manylinux_x86_64]
+          - [ubuntu-latest, manylinux2014_x86_64]
           - [macos-15-intel, macosx_x86_64]
           - [macos-15, macosx_arm64]
           - [windows-2022, win_amd64]
-        python: ["cp39", "cp310", "cp311", "cp312", "cp313", "cp314"]
+        python: ["cp39", "cp310", "cp311", "cp312", "cp313", "cp314", "cp315"]
 
     steps:
       - uses: actions/checkout@v7
 
       - name: Setup Rust toolchain (macOS / Windows)
-        if: matrix.buildplat[1] != 'manylinux_x86_64'
+        if: ${{ !startsWith(matrix.buildplat[1], 'manylinux') }}
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.buildplat[1] == 'macosx_x86_64' && 'x86_64-apple-darwin' || '' }}
 
       - name: Build wheels (Windows)
         if: matrix.buildplat[1] == 'win_amd64'
-        uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2.1
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           output-dir: wheelhouse
         env:
@@ -51,7 +52,7 @@ jobs:
 
       - name: Build wheels (macOS)
         if: startsWith(matrix.buildplat[1], 'macosx')
-        uses: pypa/cibuildwheel@v4.0.0
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           output-dir: wheelhouse
         env:
@@ -63,7 +64,7 @@ jobs:
 
       - name: Build wheels (Linux manylinux_2_28)
         if: matrix.buildplat[1] == 'manylinux_x86_64'
-        uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2.1
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           output-dir: wheelhouse
         env:
@@ -73,6 +74,20 @@ jobs:
           CIBW_BEFORE_ALL_LINUX: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           CIBW_ENVIRONMENT_LINUX: PATH="/root/.cargo/bin:$PATH"
           CIBW_TEST_COMMAND: python -B -c "from skybornspharm import Spharmt, ReducedGaussianSpharmt, SpharmTransform, invlap; print('skyborn-spharm ok')"
+
+      # glibc 2.17 wheels: required by CentOS 7 / RHEL 7 HPC nodes (e.g. gdou_sugon).
+      - name: Build wheels (Linux manylinux2014)
+        if: matrix.buildplat[1] == 'manylinux2014_x86_64'
+        uses: pypa/cibuildwheel@v4.3.5
+        with:
+          output-dir: wheelhouse
+        env:
+          CIBW_BUILD: ${{ matrix.python }}-manylinux_x86_64
+          CIBW_SKIP: "*-win32 *-musllinux*"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
+          CIBW_BEFORE_ALL_LINUX: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          CIBW_ENVIRONMENT_LINUX: PATH="/root/.cargo/bin:$PATH"
+          CIBW_TEST_SKIP: "*"
 
       - uses: actions/upload-artifact@v7
         with:

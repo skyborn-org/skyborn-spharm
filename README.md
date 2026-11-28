@@ -21,7 +21,7 @@
 - **Native `float32` & `float64` Precision**: Full `f64` internal Legendre quadrature and recurrence tables supporting both fast single-precision (`~1e-6` round-trip) and machine-precision double (`~1e-14` round-trip).
 - **High-Degree & Ultra-High-Resolution Stability**: Eliminates legacy `SPHEREPACK 3.2` `int32` workspace overflow (`F480` `960×1920`) and `real32` Legendre $2^{n-1-\text{nex}}$ underflow ($n \ge 149$).
 - **Packed Reduced Gaussian Grids**: Native `ReducedGaussianTransform` / `ReducedGaussianSpharmt` for ECMWF IFS / ERA5 reduced Gaussian grids (`O80`–`O1280`, `N320`, etc.).
-- **Drop-In `pyspharm` Compatibility**: Full Python 3.9–3.14 and NumPy 1.24–2.x support with `SpharmTransform` (C-order default) and `Spharmt` (`auto` layout).
+- **Drop-In `pyspharm` Compatibility**: Full Python 3.9–3.15 and NumPy 1.24–2.x support with `SpharmTransform` (C-order default) and `Spharmt` (`auto` layout).
 
 ---
 
