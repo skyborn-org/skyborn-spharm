@@ -792,7 +792,8 @@ def test_canonical_aliases_and_reduced_psi_chi_parity():
     )
 
     assert SpherepackError is SpheremackError
-    assert not hasattr(SpharmTransform(16, 8), "invlapspec")
+    assert hasattr(SpharmTransform(16, 8), "invlap")
+    assert hasattr(SpharmTransform(16, 8), "invlapspec")
     assert not hasattr(SpharmTransform(16, 8), "lapspec")
 
     indxm0, indxn0 = getspecindx(0)
@@ -808,7 +809,8 @@ def test_canonical_aliases_and_reduced_psi_chi_parity():
 
     rgt = ReducedGaussianTransform(pl)
     assert rgt.layout == "c"
-    assert not hasattr(rgt, "invlapspec")
+    assert hasattr(rgt, "invlap")
+    assert hasattr(rgt, "invlapspec")
     assert not hasattr(rgt, "lapspec")
 
     rgs = ReducedGaussianSpharmt(pl, layout="c")
@@ -905,4 +907,121 @@ def test_4d_and_5d_zero_copy_reshape_and_exact_parity():
     assert psi_rg.shape == (2, 3, npts) and psi_rg.dtype == np.float32
     np.testing.assert_allclose(psi_rg, psi_rg2.reshape(2, 3, npts), rtol=0, atol=0)
     np.testing.assert_allclose(chi_rg, chi_rg2.reshape(2, 3, npts), rtol=0, atol=0)
+
+
+def test_public_invlap_and_invlapspec_apis():
+    """Verify Spharmt/SpharmTransform/ReducedGaussianTransform invlap/invlapspec and standalone invlap."""
+    from skybornspharm import (
+        ReducedGaussianTransform,
+        ValidationError,
+        getspecindx,
+        invlap,
+    )
+
+    rng = np.random.default_rng(20261201)
+    nlat, nlon = 19, 36
+    rsphere = 6.3712e6
+    ntrunc = 8
+    nmdim = (ntrunc + 1) * (ntrunc + 2) // 2
+    _, indxn = getspecindx(ntrunc)
+
+    expected_scale = np.zeros(nmdim, dtype=np.float64)
+    nonzero = indxn > 0
+    expected_scale[nonzero] = -(rsphere**2) / (indxn[nonzero] * (indxn[nonzero] + 1))
+
+    # 1. Exact analytical values, n=0 zeroing, and 1D / 3D / 4D C-order & legacy layouts
+    spec_1d_64 = (
+        rng.standard_normal(nmdim) + 1j * rng.standard_normal(nmdim)
+    ).astype(np.complex128)
+    spec_1d_64[0] = 5.0 + 2.0j
+    inv_1d_64 = invlap(spec_1d_64, rsphere=rsphere)
+    assert inv_1d_64.shape == (nmdim,)
+    assert inv_1d_64.dtype == np.complex128
+    assert inv_1d_64[0] == 0.0 + 0.0j
+    np.testing.assert_allclose(inv_1d_64, spec_1d_64 * expected_scale, rtol=1e-14, atol=1e-14)
+
+    spec_1d_32 = spec_1d_64.astype(np.complex64)
+    inv_1d_32 = invlap(spec_1d_32, rsphere=rsphere)
+    assert inv_1d_32.shape == (nmdim,)
+    assert inv_1d_32.dtype == np.complex64
+    assert inv_1d_32[0] == 0.0 + 0.0j
+    np.testing.assert_allclose(
+        inv_1d_32,
+        (spec_1d_32 * expected_scale.astype(np.float32)),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+    spec_4d_c = (
+        rng.standard_normal((2, 3, 4, nmdim))
+        + 1j * rng.standard_normal((2, 3, 4, nmdim))
+    ).astype(np.complex64)
+    inv_4d_c = invlap(spec_4d_c, rsphere=rsphere, layout="c")
+    assert inv_4d_c.shape == (2, 3, 4, nmdim)
+    assert inv_4d_c.dtype == np.complex64
+    np.testing.assert_allclose(
+        inv_4d_c,
+        spec_4d_c * expected_scale.astype(np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+    spec_3d_leg = np.moveaxis(spec_4d_c[0], -1, 0).copy()
+    inv_3d_leg = invlap(spec_3d_leg, rsphere=rsphere, layout="legacy")
+    assert inv_3d_leg.shape == (nmdim, 3, 4)
+    assert inv_3d_leg.dtype == np.complex64
+    np.testing.assert_allclose(
+        np.moveaxis(inv_3d_leg, 0, -1),
+        inv_4d_c[0],
+        rtol=0,
+        atol=0,
+    )
+
+    # Empty batch (nt == 0) preserves shape and dtype
+    empty_c = np.empty((0, 3, nmdim), dtype=np.complex64)
+    inv_empty = invlap(empty_c, rsphere=rsphere, layout="c")
+    assert inv_empty.shape == (0, 3, nmdim)
+    assert inv_empty.dtype == np.complex64
+
+    # 2. SpharmTransform and Spharmt methods match standalone invlap and Poisson identity
+    sht_c = SpharmTransform(nlon, nlat, rsphere=rsphere, gridtype="regular", precision="auto")
+    sht_auto = Spharmt(nlon, nlat, rsphere=rsphere, gridtype="regular", layout="auto")
+    sht_leg = Spharmt(nlon, nlat, rsphere=rsphere, gridtype="regular", layout="legacy")
+
+    np.testing.assert_allclose(sht_c.invlap(spec_4d_c), inv_4d_c, rtol=0, atol=0)
+    np.testing.assert_allclose(sht_c.invlapspec(spec_4d_c), inv_4d_c, rtol=0, atol=0)
+    np.testing.assert_allclose(sht_auto.invlap(spec_1d_64), inv_1d_64, rtol=0, atol=0)
+    np.testing.assert_allclose(sht_leg.invlap(spec_3d_leg), inv_3d_leg, rtol=0, atol=0)
+
+    u_c = rng.standard_normal((2, 3, nlat, nlon)).astype(np.float64)
+    v_c = rng.standard_normal((2, 3, nlat, nlon)).astype(np.float64)
+    vrt_spec, div_spec = sht_c.getvrtdivspec(u_c, v_c)
+    psi_from_invlap = sht_c.spectogrd(sht_c.invlap(vrt_spec))
+    chi_from_invlap = sht_c.spectogrd(sht_c.invlap(div_spec))
+    psi_ref, chi_ref = sht_c.getpsichi(u_c, v_c)
+    np.testing.assert_allclose(psi_from_invlap, psi_ref, rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(chi_from_invlap, chi_ref, rtol=1e-13, atol=1e-13)
+
+    # 3. ReducedGaussianTransform invlap / invlapspec
+    pl = np.array([16, 20, 24, 28, 32, 28, 24, 20, 16], dtype=np.int32)
+    npts = int(pl.sum())
+    rgt = ReducedGaussianTransform(pl, rsphere=rsphere, precision="double")
+    u_rg = rng.standard_normal((2, npts)).astype(np.float64)
+    v_rg = rng.standard_normal((2, npts)).astype(np.float64)
+    vrt_rg, div_rg = rgt.getvrtdivspec(u_rg, v_rg, ntrunc=5)
+    psi_rg, chi_rg = rgt.getpsichi(u_rg, v_rg, ntrunc=5)
+    np.testing.assert_allclose(rgt.spectogrd(rgt.invlap(vrt_rg)), psi_rg, rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(rgt.spectogrd(rgt.invlapspec(div_rg)), chi_rg, rtol=1e-13, atol=1e-13)
+
+    # 4. Validation errors on invalid rsphere or spectral shape
+    with pytest.raises(ValidationError, match="rsphere must be positive"):
+        invlap(spec_1d_64, rsphere=0.0)
+    with pytest.raises(ValidationError, match="rsphere must be positive"):
+        invlap(spec_1d_64, rsphere=-10.0)
+    with pytest.raises(ValidationError, match="rsphere must be positive"):
+        invlap(spec_1d_64, rsphere=float("nan"))
+    with pytest.raises(ValidationError, match="invalid triangular spectral"):
+        invlap(np.zeros(7, dtype=np.complex128))
+    with pytest.raises(ValidationError, match="invalid triangular spectral"):
+        invlap(np.zeros((2, 7), dtype=np.complex128), layout="c")
 

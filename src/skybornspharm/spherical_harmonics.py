@@ -23,12 +23,14 @@ Class methods
    from u and v winds.
  - getgrad: compute the vector gradient given spectral coefficients.
  - getpsichi: compute streamfunction and velocity potential from winds.
+ - invlap / invlapspec: apply the inverse spherical Laplacian to spectra.
  - specsmooth: isotropic spectral smoothing.
 
 Functions
 =========
  - regrid: spectral re-gridding, with optional spectral smoothing and/or
    truncation.
+ - invlap: standalone inverse spherical Laplacian on spectral coefficients.
  - gaussian_lats_wts: compute gaussian latitudes and weights.
  - getspecindx: compute indices of zonal wavenumber and degree
    for complex spherical harmonic coefficients.
@@ -41,6 +43,7 @@ Functions
 from __future__ import annotations
 
 import math
+import sys
 from typing import Any, Callable, Literal, Optional, Tuple, Union
 
 __all__ = [
@@ -50,6 +53,7 @@ __all__ = [
     "SpheremackError",
     "ValidationError",
     "regrid",
+    "invlap",
     "gaussian_lats_wts",
     "getspecindx",
     "getgeodesicpts",
@@ -773,6 +777,14 @@ class Spharmt:
         )
         return self._restore_spectral_output(invlap_2d, resolved_layout, batch_shape)
 
+    def invlapspec(self, dataspec: ComplexArray) -> ComplexArray:
+        """Apply the inverse spherical Laplacian to spectral coefficients."""
+        return self._invlapspec(dataspec, "invlapspec")
+
+    def invlap(self, dataspec: ComplexArray) -> ComplexArray:
+        """Apply the inverse spherical Laplacian to spectral coefficients."""
+        return self._invlapspec(dataspec, "invlap")
+
     def _getuv_spec_component(
         self, dataspec: ComplexArray, component: str, operation_name: str
     ) -> Tuple[FloatArray, FloatArray]:
@@ -1248,6 +1260,71 @@ def regrid(
             )
 
     return grdout.spectogrd(dataspec)
+
+
+def invlap(
+    dataspec: ComplexArray,
+    rsphere: float = DEFAULT_EARTH_RADIUS,
+    layout: LayoutMode = "auto",
+) -> ComplexArray:
+    """Apply the inverse spherical Laplacian to triangular spectral coefficients.
+
+    Scales degree-``n`` modes by ``-rsphere**2 / (n * (n + 1))`` and zeroes ``n = 0``.
+    Supports 1D ``(nmdim,)``, C-order ``(..., nmdim)``, and legacy ``(nmdim, ...)``
+    arrays while preserving ``complex64``/``complex128`` precision and input layout.
+    """
+    try:
+        rsphere_val = float(rsphere)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"rsphere must be a positive number, got {rsphere!r}") from exc
+    if not math.isfinite(rsphere_val) or rsphere_val <= 0.0:
+        raise ValidationError(f"rsphere must be positive, got {rsphere}")
+
+    norm_layout = _validate_layout(layout)
+    arr = dataspec if type(dataspec) is np.ndarray else np.asarray(dataspec)
+    resolved_layout, _, batch_shape = _resolve_spectral_layout(
+        arr, norm_layout, sys.maxsize, "invlap"
+    )
+    compute_dtype = _resolve_public_complex_dtype("auto", arr)
+    nt = 1 if not batch_shape else math.prod(batch_shape)
+
+    if arr.ndim == 1:
+        reshaped = arr.reshape(1, arr.shape[0])
+        c_2d = (
+            reshaped
+            if reshaped.dtype == compute_dtype and reshaped.flags.c_contiguous
+            else np.ascontiguousarray(reshaped, dtype=compute_dtype)
+        )
+    elif resolved_layout == "c":
+        reshaped = arr.reshape(nt, arr.shape[-1])
+        c_2d = (
+            reshaped
+            if reshaped.dtype == compute_dtype and reshaped.flags.c_contiguous
+            else np.ascontiguousarray(reshaped, dtype=compute_dtype)
+        )
+    else:
+        c_2d = np.ascontiguousarray(
+            np.moveaxis(arr.reshape(arr.shape[0], nt), 0, -1),
+            dtype=compute_dtype,
+        )
+
+    if nt == 0:
+        out_2d = c_2d.copy()
+    else:
+        out_2d = np.asarray(
+            _call_backend(
+                _spharm_rs.invlap,
+                c_2d,
+                rsphere_val,
+                operation_name="invlap",
+            )
+        )
+
+    if not batch_shape:
+        return out_2d[0]
+    if resolved_layout == "c":
+        return out_2d.reshape(batch_shape + (out_2d.shape[1],))
+    return np.moveaxis(out_2d, 0, -1).reshape((out_2d.shape[1],) + batch_shape)
 
 
 def gaussian_lats_wts(nlat: int) -> Tuple[FloatArray, FloatArray]:

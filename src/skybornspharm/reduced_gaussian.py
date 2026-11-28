@@ -845,6 +845,14 @@ class ReducedGaussianSpharmt:
         )
         return self._restore_spectral_output(invlap_2d, resolved_layout, batch_shape)
 
+    def invlapspec(self, dataspec: ComplexArray) -> ComplexArray:
+        """Apply the inverse spherical Laplacian to spectral coefficients."""
+        return self._invlapspec(dataspec, "invlapspec")
+
+    def invlap(self, dataspec: ComplexArray) -> ComplexArray:
+        """Apply the inverse spherical Laplacian to spectral coefficients."""
+        return self._invlapspec(dataspec, "invlap")
+
     def getpsispec(
         self, ugrid: FloatArray, vgrid: FloatArray, ntrunc: Optional[int] = None
     ) -> ComplexArray:

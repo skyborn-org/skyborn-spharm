@@ -100,8 +100,11 @@ sht = SpharmTransform(
 )
 
 spec = sht.grdtospec(data_s2n)       # shape: (12, 8, nmdim)
+inv_spec = sht.invlap(spec)          # spectral inverse Laplacian (-a^2 / [n(n+1)])
 reconstructed = sht.spectogrd(spec)  # shape: (12, 8, 181, 360), S2N preserved
 ```
+
+Standalone spectral utilities such as `skybornspharm.invlap(spec, rsphere=...)` also support 1D, C-order `(..., nmdim)`, and legacy `(nmdim, ...)` spectral arrays directly.
 
 ### Legacy `pyspharm`-Compatible & Reduced Gaussian Usage
 
