@@ -139,6 +139,11 @@ c
       fnum = fnum+2.
       fden = fden+2.
    18 continue
+c [KNOWN HISTORICAL BUG] In IEEE-754 single precision, when n - 1 - nex >= 128
+c (occurring for n >= 149), `2.**(n-1-nex)` overflows to +Infinity, causing
+c `t1 = t1 / Inf = 0.0` and silently corrupting high-degree Legendre functions
+c (e.g. m=n=319 evaluates to 0.0). Fixed in ../alf.f90 (using real64) and in
+c the active Pure-Rust backend `rust/spharm-math/src/legendre.rs`.
    20 t1 = t1/2.**(n-1-nex)
       if(mod(ma/2,2) .ne. 0) t1 = -t1
       t2 = 1.

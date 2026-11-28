@@ -1,0 +1,19 @@
+[package]
+name = "spharm-core"
+version = "0.2.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[lib]
+name = "_spharm_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+spharm-math = { path = "../spharm-math" }
+pyo3 = { version = "0.30", features = ["extension-module", "num-complex"] }
+numpy = "0.30"
+faer = "0.24"
+realfft = "3.5"
+rustfft = "6.4"
+rayon = "1.12"
+num-complex = "0.4"

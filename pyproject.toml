@@ -1,17 +1,11 @@
 [build-system]
-requires = [
-    "setuptools>=61.0",
-    "wheel",
-    "numpy>=1.24.0",
-    "meson",
-    "ninja",
-]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "skyborn-spharm"
-dynamic = ["version"]
-description = "Modern Fortran-accelerated spherical harmonic transforms for Python (SPHEREPACK + reduced Gaussian grids)"
+version = "0.2.0"
+description = "Rust-accelerated spherical harmonic transforms for Python (SPHEREPACK + reduced Gaussian grids)"
 readme = "README.md"
 authors = [{ name = "Qianye Su", email = "suqianye2000@gmail.com" }]
 license = "BSD-3-Clause"
@@ -58,33 +52,11 @@ dev = [
 "Documentation" = "https://skyborn.readthedocs.io/"
 "Bug Tracker" = "https://github.com/skyborn-org/skyborn-spharm/issues"
 
-[tool.setuptools]
-package-dir = { "" = "src" }
-include-package-data = false
-
-[tool.setuptools.packages.find]
-where = ["src"]
-exclude = [
-    "*.build*",
-    "*.build*.*",
-    "*.build",
-    "*.build.*",
-]
-
-[tool.setuptools.exclude-package-data]
-"*" = [
-    "*.pyc",
-    "*.pyo",
-    "__pycache__/*",
-    "build/*",
-    "build_local/*",
-    "meson-private/*",
-    "meson-logs/*",
-    "meson-info/*",
-]
-
-[tool.setuptools.dynamic]
-version = { attr = "skybornspharm.__version__" }
+[tool.maturin]
+module-name = "skybornspharm._spharm_rs"
+manifest-path = "rust/spharm-core/Cargo.toml"
+python-source = "src"
+exclude = ["assets/**", "fortran_ref/**", "tests/_fortran_ref/**", "rust/target/**"]
 
 [tool.black]
 line-length = 88

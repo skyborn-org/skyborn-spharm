@@ -21,7 +21,12 @@
 !
 
 ! Optimized alfk subroutine for computing normalized associated Legendre polynomial coefficients
+! [FIXED] Upgraded internal recurrence and 2**(n-1-nex) scaling to IEEE real64.
+! Historical SPHEREPACK single-precision bug: when n - 1 - nex >= 128 (starting around n >= 149),
+! single-precision `2.0 ** (n - 1 - nex)` overflowed IEEE-754 real32 (> 2^128) to +Infinity, causing
+! `t1 / Inf = 0.0` and silently zeroing out high-degree Legendre coefficients (e.g. m=n=319 -> 0.0).
 subroutine alfk(n, m, cp)
+    use, intrinsic :: iso_fortran_env, only: real64
     implicit none
 
     ! Input/output parameters
@@ -29,12 +34,13 @@ subroutine alfk(n, m, cp)
     real, intent(out) :: cp(n/2 + 1)
 
     ! Local variables
-    integer :: ma, nmms2, i, l
-    real :: fnum, fnmh, pm1, t1, t2, fden, nex
-    real :: cp2, fnnp1, fnmsq, fk, a1, b1, c1
-    real, parameter :: sc10 = 1024.0
-    real, parameter :: sc20 = sc10 * sc10
-    real, parameter :: sc40 = sc20 * sc20
+    integer :: ma, nmms2, i, l, nex, iexp
+    real(real64) :: fnum, fnmh, pm1, t1, t2, fden
+    real(real64) :: cp2, fnnp1, fnmsq, fk, a1, b1, c1
+    real(real64), allocatable :: cp64(:)
+    real(real64), parameter :: sc10 = 1024.0_real64
+    real(real64), parameter :: sc20 = sc10 * sc10
+    real(real64), parameter :: sc40 = sc20 * sc20
 
     ! Initialize
     cp(1) = 0.0
@@ -59,20 +65,20 @@ subroutine alfk(n, m, cp)
     ! Main computation for n >= 2
     if (mod(n + ma, 2) == 0) then
         nmms2 = (n - ma) / 2
-        fnum = n + ma + 1
-        fnmh = n - ma + 1
-        pm1 = 1.0
+        fnum = real(n + ma + 1, real64)
+        fnmh = real(n - ma + 1, real64)
+        pm1 = 1.0_real64
     else
         nmms2 = (n - ma - 1) / 2
-        fnum = n + ma + 2
-        fnmh = n - ma + 2
-        pm1 = -1.0
+        fnum = real(n + ma + 2, real64)
+        fnmh = real(n - ma + 2, real64)
+        pm1 = -1.0_real64
     end if
 
     ! Scale computation with overflow protection
-    t1 = 1.0 / sc20
+    t1 = 1.0_real64 / sc20
     nex = 20
-    fden = 2.0
+    fden = 2.0_real64
 
     if (nmms2 >= 1) then
         ! t1/nex are loop-carried scaling recurrences: keep sequential.
@@ -82,48 +88,62 @@ subroutine alfk(n, m, cp)
                 t1 = t1 / sc40
                 nex = nex + 40
             end if
-            fnum = fnum + 2.0
-            fden = fden + 2.0
+            fnum = fnum + 2.0_real64
+            fden = fden + 2.0_real64
         end do
     end if
 
-    t1 = t1 / (2.0 ** (n - 1 - nex))
+    iexp = nex + 1 - n
+    do while (iexp > 512)
+        t1 = t1 * (2.0_real64 ** 512)
+        iexp = iexp - 512
+    end do
+    do while (iexp < -512)
+        t1 = t1 * (2.0_real64 ** (-512))
+        iexp = iexp + 512
+    end do
+    t1 = t1 * (2.0_real64 ** iexp)
     if (mod(ma/2, 2) /= 0) t1 = -t1
 
-    t2 = 1.0
+    t2 = 1.0_real64
     if (ma > 0) then
         ! t2/fnmh are loop-carried recurrences: keep sequential.
         do i = 1, ma
             t2 = fnmh * t2 / (fnmh + pm1)
-            fnmh = fnmh + 2.0
+            fnmh = fnmh + 2.0_real64
         end do
     end if
 
-    cp2 = t1 * sqrt((n + 0.5) * t2)
-    fnnp1 = n * (n + 1)
-    fnmsq = fnnp1 - 2.0 * ma * ma
+    allocate(cp64(n/2 + 1))
+    cp64(1) = 0.0_real64
+    cp2 = t1 * sqrt((real(n, real64) + 0.5_real64) * t2)
+    fnnp1 = real(n, real64) * real(n + 1, real64)
+    fnmsq = fnnp1 - 2.0_real64 * real(ma, real64) * real(ma, real64)
     l = (n + 1) / 2
     if (mod(n, 2) == 0 .and. mod(ma, 2) == 0) l = l + 1
-    cp(l) = cp2
+    cp64(l) = cp2
 
-    if (m < 0 .and. mod(ma, 2) /= 0) cp(l) = -cp(l)
+    if (m < 0 .and. mod(ma, 2) /= 0) cp64(l) = -cp64(l)
 
-    if (l <= 1) return
+    if (l > 1) then
+        ! Backward recurrence in real64 before narrowing to output
+        fk = real(n, real64)
+        a1 = (fk - 2.0_real64) * (fk - 1.0_real64) - fnnp1
+        b1 = 2.0_real64 * (fk * fk - fnmsq)
+        cp64(l - 1) = b1 * cp64(l) / a1
 
-    ! Backward recurrence
-    fk = n
-    a1 = (fk - 2.0) * (fk - 1.0) - fnnp1
-    b1 = 2.0 * (fk * fk - fnmsq)
-    cp(l - 1) = b1 * cp(l) / a1
+        do while (l > 2)
+            l = l - 1
+            fk = fk - 2.0_real64
+            a1 = (fk - 2.0_real64) * (fk - 1.0_real64) - fnnp1
+            b1 = -2.0_real64 * (fk * fk - fnmsq)
+            c1 = (fk + 1.0_real64) * (fk + 2.0_real64) - fnnp1
+            cp64(l - 1) = -(b1 * cp64(l) + c1 * cp64(l + 1)) / a1
+        end do
+    end if
 
-    do while (l > 2)
-        l = l - 1
-        fk = fk - 2.0
-        a1 = (fk - 2.0) * (fk - 1.0) - fnnp1
-        b1 = -2.0 * (fk * fk - fnmsq)
-        c1 = (fk + 1.0) * (fk + 2.0) - fnnp1
-        cp(l - 1) = -(b1 * cp(l) + c1 * cp(l + 1)) / a1
-    end do
+    cp(1:(n/2 + 1)) = real(cp64(1:(n/2 + 1)))
+    deallocate(cp64)
 
 end subroutine alfk
 

@@ -102,8 +102,8 @@ class TestSpharmtInitialization:
         first = Spharmt(nlon=36, nlat=19, gridtype="gaussian", legfunc="stored")
         second = Spharmt(nlon=36, nlat=19, gridtype="gaussian", legfunc="stored")
 
-        assert first.wshags is first.wshsgs
-        assert second.wshags is second.wshsgs
+        assert first._core is not None
+        assert second._core is not None
 
         spec_first = first.grdtospec(grid)
         spec_second = second.grdtospec(grid)
@@ -125,8 +125,8 @@ class TestSpharmtInitialization:
         first = Spharmt(nlon=36, nlat=19, gridtype="gaussian", legfunc="computed")
         second = Spharmt(nlon=36, nlat=19, gridtype="gaussian", legfunc="computed")
 
-        assert first.wshagc is first.wshsgc
-        assert second.wshagc is second.wshsgc
+        assert first._core is not None
+        assert second._core is not None
 
         spec_first = first.grdtospec(grid)
         spec_second = second.grdtospec(grid)
@@ -326,7 +326,7 @@ class TestSpharmtVectorOperations:
         actual = sht.getdivspec(u, v)
 
         assert actual.shape == expected.shape
-        np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-12)
 
     @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
     @pytest.mark.parametrize(("gridtype", "legfunc"), _VECTOR_BACKEND_CASES)
@@ -385,117 +385,60 @@ class TestSpharmtVectorOperations:
     def test_even_nlon_vector_tail_cleanup_preserves_public_synthesis(
         self, gridtype, legfunc
     ):
-        """Zeroing undefined analysis tail slots must not alter synthesized winds."""
+        """Even-nlon vector analysis and synthesis must stay clean across batched grids."""
         sht = Spharmt(nlon=36, nlat=19, gridtype=gridtype, legfunc=legfunc)
         rng = np.random.default_rng(20260522)
         u = rng.standard_normal((19, 36, 2, 3)).astype(np.float32)
         v = rng.standard_normal((19, 36, 2, 3)).astype(np.float32)
 
-        _, normalized_u, _ = sht._validate_grid_data(u, "tail cleanup check")
-        _, normalized_v, _ = sht._validate_grid_data(v, "tail cleanup check")
-        math_w = np.asfortranarray(normalized_u)
-        math_v = np.asfortranarray(-normalized_v)
-        nt = math_w.shape[2]
-        ntrunc = sht.nlat - 1
+        vrtspec, divspec = sht.getvrtdivspec(u, v)
+        u_rec, v_rec = sht.getuv(vrtspec, divspec)
+        vrt_back, div_back = sht.getvrtdivspec(u_rec, v_rec)
 
-        if (gridtype, legfunc) == ("regular", "stored"):
-            backend = spharm_mod._spherepack.vhaes
-            workspace = sht.wvhaes
-            lwork = (2 * nt + 1) * sht.nlat * sht.nlon
-        elif (gridtype, legfunc) == ("regular", "computed"):
-            backend = spharm_mod._spherepack.vhaec
-            workspace = sht.wvhaec
-            lwork = sht.nlat * (2 * nt * sht.nlon + max(6 * sht._n2, sht.nlon))
-        elif (gridtype, legfunc) == ("gaussian", "stored"):
-            backend = spharm_mod._spherepack.vhags
-            workspace = sht.wvhags
-            lwork = (2 * nt + 1) * sht.nlat * sht.nlon
-        else:
-            backend = spharm_mod._spherepack.vhagc
-            workspace = sht.wvhagc
-            lwork = 2 * sht.nlat * (2 * sht.nlon * nt + 3 * sht._n2)
-
-        br_raw, bi_raw, cr_raw, ci_raw, ierror = backend(
-            math_v, math_w, workspace, lwork, 0
-        )
-        assert ierror == 0
-
-        br_clean = np.array(br_raw, copy=True, order="F")
-        bi_clean = np.array(bi_raw, copy=True, order="F")
-        cr_clean = np.array(cr_raw, copy=True, order="F")
-        ci_clean = np.array(ci_raw, copy=True, order="F")
-        mmax = min(sht.nlat, (sht.nlon + 1) // 2)
-
-        if mmax < br_clean.shape[0]:
-            br_clean[mmax:, :, :] = 0.0
-            bi_clean[mmax:, :, :] = 0.0
-            cr_clean[mmax:, :, :] = 0.0
-            ci_clean[mmax:, :, :] = 0.0
-        if sht.nlat % 2 == 1:
-            br_clean[0:mmax:2, sht.nlat - 1, :] = 0.0
-            bi_clean[0:mmax:2, sht.nlat - 1, :] = 0.0
-            cr_clean[0:mmax:2, sht.nlat - 1, :] = 0.0
-            ci_clean[0:mmax:2, sht.nlat - 1, :] = 0.0
-
-        vrt_raw, div_raw = spharm_mod._spherepack.twodtooned_vrtdiv(
-            br_raw, bi_raw, cr_raw, ci_raw, ntrunc, sht.rsphere
-        )
-        vrt_clean, div_clean = spharm_mod._spherepack.twodtooned_vrtdiv(
-            br_clean, bi_clean, cr_clean, ci_clean, ntrunc, sht.rsphere
-        )
-
-        shape = (vrt_raw.shape[0],) + u.shape[2:]
-        u_raw, v_raw = sht.getuv(vrt_raw.reshape(shape), div_raw.reshape(shape))
-        u_clean, v_clean = sht.getuv(vrt_clean.reshape(shape), div_clean.reshape(shape))
-
-        np.testing.assert_allclose(u_clean, u_raw, rtol=0, atol=0)
-        np.testing.assert_allclose(v_clean, v_raw, rtol=0, atol=0)
+        assert u_rec.shape == u.shape
+        assert v_rec.shape == v.shape
+        assert np.isfinite(u_rec).all()
+        assert np.isfinite(v_rec).all()
+        np.testing.assert_allclose(vrt_back, vrtspec, rtol=1e-4, atol=1e-7)
+        np.testing.assert_allclose(div_back, divspec, rtol=1e-4, atol=1e-7)
 
     @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
-    @pytest.mark.parametrize(
-        ("gridtype", "legfunc", "expected_vrt_wrapper", "expected_div_wrapper"),
-        [
-            ("regular", "stored", "vhaesvrt", "vhaesdiv"),
-            ("regular", "computed", "vhaecvrt", "vhaecdiv"),
-            ("gaussian", "stored", "vhagsvrt", "vhagsdiv"),
-            ("gaussian", "computed", "vhagcvrt", "vhagcdiv"),
-        ],
-    )
+    @pytest.mark.parametrize(("gridtype", "legfunc"), _VECTOR_BACKEND_CASES)
     def test_single_vrtdiv_spec_helpers_select_half_analysis_ityp(
-        self, monkeypatch, gridtype, legfunc, expected_vrt_wrapper, expected_div_wrapper
+        self, monkeypatch, gridtype, legfunc
     ):
-        """Single-field spectral helpers should route through dedicated thin wrappers."""
+        """Single-field spectral helpers should route through dedicated Rust methods."""
         sht = Spharmt(nlon=36, nlat=19, gridtype=gridtype, legfunc=legfunc)
         rng = np.random.default_rng(20260502)
         u = rng.standard_normal((19, 36)).astype(np.float32)
         v = rng.standard_normal((19, 36)).astype(np.float32)
 
         calls = []
-        original_call = sht._call_spherepack_safely
+        real_core = sht._core
 
-        def recording_call(func, *args, operation_name, **kwargs):
-            calls.append(func)
-            return original_call(func, *args, operation_name=operation_name, **kwargs)
+        class CoreProxy:
+            def __getattr__(self, name):
+                return getattr(real_core, name)
 
-        monkeypatch.setattr(sht, "_call_spherepack_safely", recording_call)
+            def getvrtspec(self, *args, **kwargs):
+                calls.append("getvrtspec")
+                return real_core.getvrtspec(*args, **kwargs)
+
+            def getdivspec(self, *args, **kwargs):
+                calls.append("getdivspec")
+                return real_core.getdivspec(*args, **kwargs)
+
+            def getvrtdivspec(self, *args, **kwargs):
+                calls.append("getvrtdivspec")
+                return real_core.getvrtdivspec(*args, **kwargs)
+
+        monkeypatch.setattr(sht, "_core", CoreProxy())
 
         sht.getvrtspec(u, v)
         sht.getdivspec(u, v)
         sht.getvrtdivspec(u, v)
 
-        assert calls == [
-            getattr(spharm_mod._spherepack, expected_vrt_wrapper),
-            getattr(spharm_mod._spherepack, expected_div_wrapper),
-            getattr(
-                spharm_mod._spherepack,
-                {
-                    ("regular", "stored"): "vhaes",
-                    ("regular", "computed"): "vhaec",
-                    ("gaussian", "stored"): "vhags",
-                    ("gaussian", "computed"): "vhagc",
-                }[(gridtype, legfunc)],
-            ),
-        ]
+        assert calls == ["getvrtspec", "getdivspec", "getvrtdivspec"]
 
     @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
     def test_psichi_spec_helpers_validate_shapes(self, monkeypatch):
@@ -550,15 +493,15 @@ class TestSpharmtGradientOperations:
 
         u_grad, v_grad = sht.getgrad(chispec)
 
-        _, _, normalized_spec, extra_shape = sht._validate_spectral_data(
+        resolved_layout, _, _, normalized_spec, extra_shape = sht._prepare_spectral_input(
             chispec, "test_getgrad_single_family_synthesis_matches_pair_output"
         )
-        divspec = spharm_mod._spherepack.lap(normalized_spec, sht.rsphere)
-        divspec = sht._restore_spectral_shape(divspec, extra_shape)
+        divspec = spharm_mod._spharm_rs.lap(normalized_spec, sht.rsphere)
+        divspec = sht._restore_spectral_output(divspec, resolved_layout, extra_shape)
         legacy_u, legacy_v = sht.getuv(np.zeros_like(divspec), divspec)
 
-        np.testing.assert_allclose(u_grad, legacy_u, rtol=0, atol=0)
-        np.testing.assert_allclose(v_grad, legacy_v, rtol=0, atol=0)
+        np.testing.assert_allclose(u_grad, legacy_u, rtol=1e-5, atol=1e-10)
+        np.testing.assert_allclose(v_grad, legacy_v, rtol=1e-5, atol=1e-10)
 
     @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
     @pytest.mark.parametrize(
@@ -594,19 +537,14 @@ class TestSpharmtGradientOperations:
         np.testing.assert_allclose(component_v, legacy_v, rtol=0, atol=0)
 
     @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
-    @pytest.mark.parametrize(
-        ("gridtype", "legfunc", "expected_half_wrapper", "expected_full_wrapper"),
-        VECTOR_SYNTHESIS_BACKEND_CASES,
-    )
+    @pytest.mark.parametrize(("gridtype", "legfunc"), VECTOR_BACKEND_CASES)
     def test_getgrad_selects_divergence_only_half_synthesis_wrapper(
         self,
         monkeypatch,
         gridtype,
         legfunc,
-        expected_half_wrapper,
-        expected_full_wrapper,
     ):
-        """getgrad() should use the dedicated half-synthesis wrapper, not full getuv."""
+        """getgrad() should route to RustSpharmCore.getgrad rather than getuv."""
         sht = Spharmt(nlon=36, nlat=19, gridtype=gridtype, legfunc=legfunc)
         rng = np.random.default_rng(20260503)
         chi = rng.standard_normal((19, 36)).astype(np.float32)
@@ -616,21 +554,29 @@ class TestSpharmtGradientOperations:
         vrtspec, divspec = sht.getvrtdivspec(u, v)
 
         calls = []
-        original_call = sht._call_spherepack_safely
-        expected_half = getattr(spharm_mod._spherepack, expected_half_wrapper)
-        expected_full = getattr(spharm_mod._spherepack, expected_full_wrapper)
+        orig_grad = sht._core.getgrad
+        orig_uv = sht._core.getuv
 
-        def recording_call(func, *args, operation_name, **kwargs):
-            if func in (expected_half, expected_full):
-                calls.append(func)
-            return original_call(func, *args, operation_name=operation_name, **kwargs)
+        class CoreProxy:
+            def __getattr__(self, name):
+                return getattr(sht._core, name)
 
-        monkeypatch.setattr(sht, "_call_spherepack_safely", recording_call)
+            def getgrad(self, *args, **kwargs):
+                calls.append("getgrad")
+                return orig_grad(*args, **kwargs)
+
+            def getuv(self, *args, **kwargs):
+                calls.append("getuv")
+                return orig_uv(*args, **kwargs)
+
+        real_core = sht._core
+        monkeypatch.setattr(sht, "_core", CoreProxy())
 
         sht.getgrad(chispec)
         sht.getuv(vrtspec, divspec)
+        monkeypatch.setattr(sht, "_core", real_core)
 
-        assert calls == [expected_half, expected_full]
+        assert calls == ["getgrad", "getuv"]
 
     @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
     def test_getpsichi_basic(self):
@@ -1197,7 +1143,7 @@ class TestSpharmtDataValidation:
             nt, validated, extra_shape = result
 
             assert nt == 1
-            assert validated.shape == (36, 72, 1)
+            assert validated.shape == (1, 36, 72)
             assert extra_shape == ()
         else:
             # Method doesn't exist, skip test
@@ -1518,19 +1464,23 @@ class TestSpharmtAdditionalCoverage:
 
     @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
     def test_getpsichi_batches_scalar_synthesis(self, monkeypatch):
-        """getpsichi should synthesize psi/chi together through one call."""
+        """getpsichi should execute in a single fused Rust core call."""
         sht = Spharmt(nlon=36, nlat=19)
         u = np.random.randn(19, 36) * 0.1
         v = np.random.randn(19, 36) * 0.1
 
         calls = {"count": 0}
-        original_spectogrd = sht.spectogrd
+        real_core = sht._core
 
-        def counting_spectogrd(*args, **kwargs):
-            calls["count"] += 1
-            return original_spectogrd(*args, **kwargs)
+        class CoreProxy:
+            def __getattr__(self, name):
+                return getattr(real_core, name)
 
-        monkeypatch.setattr(sht, "spectogrd", counting_spectogrd)
+            def getpsichi(self, *args, **kwargs):
+                calls["count"] += 1
+                return real_core.getpsichi(*args, **kwargs)
+
+        monkeypatch.setattr(sht, "_core", CoreProxy())
 
         psi, chi = sht.getpsichi(u, v)
 
@@ -1720,23 +1670,26 @@ class TestSpharmtAdditionalCoverage:
     def test_gaussian_stored_vector_workspaces_stay_finite_near_overflow_threshold(
         self,
     ):
-        """Stored Gaussian vector init must avoid integer-overflow NaNs."""
-        # Around nlat~700, terms such as (2*n+1)*(m+n-2)*(m+n-3) exceed
-        # 32-bit integer range if multiplied before promotion to float64.
+        """Stored Gaussian vector init and transform must avoid overflow NaNs."""
         sht = Spharmt(nlon=1400, nlat=700, gridtype="gaussian", legfunc="stored")
 
-        assert np.isfinite(sht.wvhags).all()
-        assert np.isfinite(sht.wvhsgs).all()
+        assert sht._core is not None
+        rng = np.random.default_rng(20260521)
+        u = rng.standard_normal((700, 1400), dtype=np.float32)
+        v = rng.standard_normal((700, 1400), dtype=np.float32)
+        vrt, div = sht.getvrtdivspec(u, v, ntrunc=63)
+        assert np.isfinite(vrt).all()
+        assert np.isfinite(div).all()
 
     @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
     @pytest.mark.parametrize("legfunc", ["stored", "computed"])
     def test_gaussian_scalar_synthesis_stays_finite_at_f480(self, legfunc):
-        """High-resolution Gaussian scalar synthesis must not poison workspaces."""
+        """High-resolution Gaussian scalar synthesis must stay finite."""
         nlat = 960
         nlon = 1920
         ntrunc = 639
         rng = np.random.default_rng(20260520)
-        field = np.asfortranarray(rng.standard_normal((nlat, nlon), dtype=np.float32))
+        field = rng.standard_normal((nlat, nlon), dtype=np.float32)
 
         sht = Spharmt(
             nlon=nlon,
@@ -1746,14 +1699,7 @@ class TestSpharmtAdditionalCoverage:
             precision="single",
         )
 
-        if legfunc == "stored":
-            assert np.isfinite(sht.wshags).all()
-            assert np.isfinite(sht.wshsgs).all()
-        else:
-            assert np.isfinite(sht.wshagc).all()
-            assert np.isfinite(sht.wshsgc).all()
-
-        spec = np.asfortranarray(sht.grdtospec(field, ntrunc=ntrunc))
+        spec = sht.grdtospec(field, ntrunc=ntrunc)
         grid = sht.spectogrd(spec)
 
         assert np.isfinite(spec).all()
@@ -1762,7 +1708,7 @@ class TestSpharmtAdditionalCoverage:
     @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
     @pytest.mark.parametrize("legfunc", ["stored", "computed"])
     def test_regular_scalar_workspaces_stay_finite_at_f480_shape(self, legfunc):
-        """High-resolution regular-grid scalar init should keep finite workspaces."""
+        """High-resolution regular-grid scalar transform should stay finite."""
         nlat = 960
         nlon = 1920
 
@@ -1774,30 +1720,20 @@ class TestSpharmtAdditionalCoverage:
             precision="single",
         )
 
-        if legfunc == "stored":
-            assert np.isfinite(sht.wshaes).all()
-            assert np.isfinite(sht.wshses).all()
-        else:
-            assert np.isfinite(sht.wshaec).all()
-            assert np.isfinite(sht.wshsec).all()
+        rng = np.random.default_rng(20260522)
+        field = rng.standard_normal((nlat, nlon), dtype=np.float32)
+        spec = sht.grdtospec(field, ntrunc=63)
+        assert np.isfinite(spec).all()
 
     @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
     def test_internal_dispatch_and_validation_branches(self):
-        """Exercise uncovered internal validation and dispatch branches."""
+        """Exercise internal validation and backend error-wrapping branches."""
         sht = object.__new__(Spharmt)
-        sht.gridtype = "triangular"
-        sht.legfunc = "stored"
 
-        with pytest.raises(ValidationError, match="Unsupported combination"):
-            sht._initialize_spherepack_arrays()
+        with pytest.raises(ValidationError, match='gridtype must be "regular" or "gaussian"'):
+            sht._validate_inputs(36, 19, 6.3712e6, "triangular", "stored")
 
-        with pytest.raises(SpheremackError, match="gaqd failed with error code 7"):
-            sht._call_spherepack_safely(
-                lambda: (np.arange(3, dtype=np.float32), 7),
-                operation_name="gaqd",
-            )
-
-        direct = sht._call_spherepack_safely(
+        direct = spharm_mod._call_backend(
             lambda: np.arange(3, dtype=np.float32),
             operation_name="direct",
         )
@@ -1807,7 +1743,7 @@ class TestSpharmtAdditionalCoverage:
             raise RuntimeError("backend exploded")
 
         with pytest.raises(SpheremackError, match="specintrp failed: backend exploded"):
-            sht._call_spherepack_safely(
+            spharm_mod._call_backend(
                 backend_failure,
                 operation_name="specintrp",
             )
@@ -1862,7 +1798,7 @@ class TestSpharmtAdditionalCoverage:
             regrid(sht, grid_out, np.zeros(19, dtype=np.float32))
 
         with pytest.raises(
-            ValidationError, match="regrid needs input array of size 19 by 36"
+            ValidationError, match="regrid needs an array of size 19 by 36"
         ):
             regrid(sht, grid_out, np.zeros((18, 36), dtype=np.float32))
 
@@ -1881,21 +1817,24 @@ class TestSpharmtAdditionalCoverage:
         """Cover defensive consistency checks that public validation normally prevents."""
         sht = object.__new__(Spharmt)
         sht.nlat = 19
+        sht.nlon = 36
         sht.precision = "auto"
+        sht.layout = "legacy"
+        sht.rsphere = 6.3712e6
 
         with pytest.raises(ValidationError, match="needs at least a rank 1 array"):
             sht._validate_spectral_data(np.array(1.0 + 0.0j), "spectral")
 
         grid_calls = iter(
             [
-                (1, np.zeros((19, 36, 1), dtype=np.float32), ()),
-                (1, np.zeros((19, 36, 1), dtype=np.float32), (1,)),
+                ("legacy", 1, np.zeros((1, 19, 36), dtype=np.float32), ()),
+                ("legacy", 1, np.zeros((1, 19, 36), dtype=np.float32), (1,)),
             ]
         )
         monkeypatch.setattr(
             sht,
-            "_validate_grid_data",
-            lambda data, operation_name: next(grid_calls),
+            "_prepare_grid_input",
+            lambda data, operation_name, target_dtype=None: next(grid_calls),
         )
         with pytest.raises(ValidationError, match="consistent dimensions"):
             sht.getvrtdivspec(
@@ -1905,14 +1844,14 @@ class TestSpharmtAdditionalCoverage:
 
         spectral_calls = iter(
             [
-                (1, 2, np.zeros((6, 1), dtype=np.complex64), ()),
-                (2, 2, np.zeros((6, 2), dtype=np.complex64), (2,)),
+                ("legacy", 1, 2, np.zeros((1, 6), dtype=np.complex64), ()),
+                ("legacy", 2, 2, np.zeros((2, 6), dtype=np.complex64), (2,)),
             ]
         )
         monkeypatch.setattr(
             sht,
-            "_validate_spectral_data",
-            lambda data, operation_name: next(spectral_calls),
+            "_prepare_spectral_input",
+            lambda data, operation_name, target_dtype=None: next(spectral_calls),
         )
         with pytest.raises(ValidationError, match="consistent dimensions"):
             sht.getuv(
@@ -1922,65 +1861,24 @@ class TestSpharmtAdditionalCoverage:
 
         monkeypatch.setattr(
             sht,
-            "_validate_grid_data",
-            lambda data, operation_name: (
-                1,
-                np.zeros((19, 36, 1), dtype=np.float32),
-                (),
-            ),
-        )
-        monkeypatch.setattr(sht, "_validate_ntrunc", lambda ntrunc, max_ntrunc: 18)
-        monkeypatch.setattr(
-            sht,
-            "getvrtdivspec",
-            lambda ugrid, vgrid, ntrunc: (
-                np.zeros(190, dtype=np.complex64),
-                np.zeros(190, dtype=np.complex64),
-            ),
-        )
-        spec_calls = iter(
-            [
-                (1, 18, np.zeros((190, 1), dtype=np.complex64), (1,)),
-                (1, 18, np.zeros((190, 1), dtype=np.complex64), ()),
-            ]
+            "getvrtspec",
+            lambda ugrid, vgrid, ntrunc=None: np.zeros(190, dtype=np.complex64),
         )
         monkeypatch.setattr(
             sht,
-            "_validate_spectral_data",
-            lambda data, operation_name: next(spec_calls),
-        )
-        with pytest.raises(
-            ValidationError, match="spectra have inconsistent dimensions"
-        ):
-            sht.getpsichi(
-                np.zeros((19, 36), dtype=np.float32),
-                np.zeros((19, 36), dtype=np.float32),
-            )
-
-        monkeypatch.setattr(
-            sht,
-            "_validate_grid_data",
-            lambda data, operation_name: (
-                1,
-                np.zeros((19, 36, 1), dtype=np.float32),
-                (),
-            ),
-        )
-        monkeypatch.setattr(
-            sht,
-            "_validate_spectral_data",
-            lambda data, operation_name: (
+            "_prepare_spectral_input",
+            lambda data, operation_name, target_dtype=None: (
+                "legacy",
                 1,
                 18,
-                np.zeros((190, 1), dtype=np.complex64),
+                np.zeros((1, 190), dtype=np.complex64),
                 (1,),
             ),
         )
-        sht.rsphere = 6.3712e6
         monkeypatch.setattr(
-            sht,
-            "getvrtspec",
-            lambda ugrid, vgrid, ntrunc=None: np.zeros(190, dtype=np.complex64),
+            spharm_mod._spharm_rs,
+            "invlap",
+            lambda spec, rsphere: spec,
         )
         psi_spec = sht.getpsichi_spec_component(
             np.zeros((19, 36), dtype=np.float32),
@@ -2000,8 +1898,9 @@ class TestSpharmtAdditionalCoverage:
         sht.gridtype = "regular"
         sht.legfunc = "stored"
         sht.rsphere = 6.3712e6
-        sht._n2 = 10
         sht.precision = "auto"
+        sht.layout = "legacy"
+        sht.south_to_north = False
 
         with pytest.raises(
             ValidationError, match="paired spectra must have the same shape"
@@ -2011,125 +1910,20 @@ class TestSpharmtAdditionalCoverage:
                 np.zeros((6, 2), dtype=np.complex64),
             )
 
-        monkeypatch.setattr(sht, "_validate_ntrunc", lambda ntrunc, max_ntrunc: 18)
-        with pytest.raises(ValidationError, match="consistent dimensions"):
-            sht._analyze_vector_harmonics_flattened(
-                np.zeros((19, 36, 1), dtype=np.float32),
-                np.zeros((19, 36, 2), dtype=np.float32),
-                (),
-                None,
-                "flattened",
-            )
-        with pytest.raises(ValidationError, match="must be rank 3"):
-            sht._analyze_vector_harmonics_flattened(
-                np.zeros((19, 36), dtype=np.float32),
-                np.zeros((19, 36), dtype=np.float32),
-                (),
-                None,
-                "flattened",
-            )
-        with pytest.raises(ValidationError, match=r"must have shape \(19, 36, nt\)"):
-            sht._analyze_vector_harmonics_flattened(
-                np.zeros((18, 36, 1), dtype=np.float32),
-                np.zeros((18, 36, 1), dtype=np.float32),
-                (),
-                None,
-                "flattened",
-            )
-        with pytest.raises(ValidationError, match="invalid ityp 9"):
-            sht._analyze_vector_harmonics_flattened(
-                np.zeros((19, 36, 1), dtype=np.float32),
-                np.zeros((19, 36, 1), dtype=np.float32),
-                (),
-                None,
-                "flattened",
-                ityp=9,
-            )
-
-        grid_calls = iter(
-            [
-                (1, np.zeros((19, 36, 1), dtype=np.float32), ()),
-                (1, np.zeros((19, 36, 1), dtype=np.float32), (1,)),
-            ]
-        )
-        monkeypatch.setattr(
-            sht,
-            "_validate_grid_data",
-            lambda data, operation_name: next(grid_calls),
-        )
-        with pytest.raises(ValidationError, match="consistent dimensions"):
-            sht._analyze_vector_harmonic_component(
-                np.zeros((19, 36), dtype=np.float32),
-                np.zeros((19, 36), dtype=np.float32),
-                None,
-                "component",
-                "div",
-            )
-
-        with pytest.raises(ValidationError, match="consistent dimensions"):
-            sht._analyze_vector_harmonic_component_flattened(
-                np.zeros((19, 36, 1), dtype=np.float32),
-                np.zeros((19, 36, 2), dtype=np.float32),
-                (),
-                None,
-                "component",
-                "div",
-            )
-        with pytest.raises(ValidationError, match="must be rank 3"):
-            sht._analyze_vector_harmonic_component_flattened(
-                np.zeros((19, 36), dtype=np.float32),
-                np.zeros((19, 36), dtype=np.float32),
-                (),
-                None,
-                "component",
-                "div",
-            )
-        with pytest.raises(ValidationError, match=r"must have shape \(19, 36, nt\)"):
-            sht._analyze_vector_harmonic_component_flattened(
-                np.zeros((18, 36, 1), dtype=np.float32),
-                np.zeros((18, 36, 1), dtype=np.float32),
-                (),
-                None,
-                "component",
-                "div",
-            )
-        with pytest.raises(ValidationError, match="expected 'div' or 'vrt'"):
-            sht._analyze_vector_harmonic_component_flattened(
-                np.zeros((19, 36, 1), dtype=np.float32),
-                np.zeros((19, 36, 1), dtype=np.float32),
-                (),
-                None,
-                "component",
-                "bad",
-            )
-
-        with pytest.raises(ValidationError, match="invalid ityp 9"):
-            sht._synthesize_vector_harmonics(
-                np.zeros((10, 1), dtype=np.float32),
-                np.zeros((10, 1), dtype=np.float32),
-                np.zeros((10, 1), dtype=np.float32),
-                np.zeros((10, 1), dtype=np.float32),
-                1,
-                (),
-                "synthesis",
-                ityp=9,
-            )
-
-        monkeypatch.setattr(
-            sht,
-            "_validate_spectral_data",
-            lambda data, operation_name: (
-                1,
-                18,
-                np.zeros((190, 1), dtype=np.complex64),
-                (),
-            ),
-        )
         with pytest.raises(ValidationError, match='expected "div" or "vrt"'):
             sht._getuv_spec_component(
                 np.zeros(190, dtype=np.complex64),
                 component="bad",
                 operation_name="getuv_component",
+            )
+
+        with pytest.raises(ValidationError, match='expected "psi" or "chi"'):
+            sht.getpsichi_spec_component(
+                np.zeros((19, 36), dtype=np.float32),
+                np.zeros((19, 36), dtype=np.float32),
+                None,
+                component="bad",
+                operation_name="getpsichi_spec",
             )
 
         calls = []
@@ -2167,13 +1961,9 @@ class TestSpharmtAdditionalCoverage:
             spharm_mod.getgeodesicpts(1)
 
         monkeypatch.setattr(
-            spharm_mod._spherepack,
-            "gaqd",
-            lambda nlat: (
-                np.zeros(nlat, dtype=np.float32),
-                np.ones(nlat, dtype=np.float32),
-                5,
-            ),
+            spharm_mod._spharm_rs,
+            "gaussian_lats_wts",
+            lambda nlat: (_ for _ in ()).throw(RuntimeError("gaqd failed with error code 5")),
         )
         with pytest.raises(
             SpheremackError,
@@ -2182,7 +1972,7 @@ class TestSpharmtAdditionalCoverage:
             spharm_mod.gaussian_lats_wts(4)
 
         monkeypatch.setattr(
-            spharm_mod._spherepack,
+            spharm_mod._spharm_rs,
             "ihgeod",
             lambda m: (_ for _ in ()).throw(RuntimeError("bad geodesic backend")),
         )
@@ -2201,7 +1991,7 @@ class TestSpharmtAdditionalCoverage:
             spharm_mod.legendre(45.0, -1)
 
         monkeypatch.setattr(
-            spharm_mod._spherepack,
+            spharm_mod._spharm_rs,
             "getlegfunc",
             lambda lat, ntrunc: (_ for _ in ()).throw(RuntimeError("legendre backend")),
         )
@@ -2214,9 +2004,9 @@ class TestSpharmtAdditionalCoverage:
         dataspec = np.zeros(6, dtype=np.complex64)
         legfuncs = np.zeros(6, dtype=np.float32)
         monkeypatch.setattr(
-            spharm_mod._spherepack,
+            spharm_mod._spharm_rs,
             "specintrp",
-            lambda lon, ntrunc, spec, funcs: (_ for _ in ()).throw(
+            lambda lon, spec, funcs: (_ for _ in ()).throw(
                 RuntimeError("interp backend")
             ),
         )

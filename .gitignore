@@ -10,6 +10,12 @@ __pycache__/
 *.dll
 *.pyd
 
+# Rust / Maturin / Test Oracle
+tests/_fortran_ref/
+rust/target/
+target/
+*.whl
+
 # Distribution / packaging
 .Python
 build/

@@ -202,8 +202,6 @@ def test_reduced_gaussian_getgrad_pair_matches_individual_calls():
 
 @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
 def test_reduced_gaussian_getgrad_prefers_single_component_kernel(monkeypatch):
-    import skybornspharm.reduced_gaussian as reduced_module
-
     nlat = 9
     pl = np.array([16, 20, 24, 28, 32, 28, 24, 20, 16], dtype=np.int32)
     ntrunc = 5
@@ -216,39 +214,25 @@ def test_reduced_gaussian_getgrad_prefers_single_component_kernel(monkeypatch):
 
     reduced = ReducedGaussianSpharmt(pl)
     direct_calls = []
+    real_core = reduced._core
 
-    def fake_getgrad(
-        spec_a,
-        pl_arg,
-        basis,
-        dbasis,
-        sin_theta,
-        ntrunc_arg,
-        ngptot,
-        rsphere,
-    ):
-        direct_calls.append(spec_a.shape)
-        nt = spec_a.shape[1]
-        zeros = np.zeros((ngptot, nt), dtype=np.float32, order="F")
-        return zeros, zeros.copy(order="F"), 0
+    class CoreProxy:
+        def __getattr__(self, name):
+            return getattr(real_core, name)
 
-    monkeypatch.setattr(
-        reduced_module._spherepack,
-        "reduced_gaussian_getgrad",
-        fake_getgrad,
-    )
-    monkeypatch.setattr(
-        reduced_module._spherepack,
-        "reduced_gaussian_getgrad_pair",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("getgrad should prefer reduced_gaussian_getgrad")
-        ),
-    )
+        def getgrad(self, spec_a, south_to_north=False):
+            direct_calls.append(spec_a.shape)
+            return real_core.getgrad(spec_a, south_to_north=south_to_north)
+
+        def getgrad_pair(self, *args, **kwargs):
+            raise AssertionError("getgrad should prefer RustReducedSpharmCore.getgrad")
+
+    monkeypatch.setattr(reduced, "_core", CoreProxy())
 
     reduced.getgrad(spec)
     reduced.getgrad(spec)
 
-    assert direct_calls == [(nspec, 1), (nspec, 1)]
+    assert direct_calls == [(1, nspec), (1, nspec)]
 
 
 @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
@@ -289,26 +273,6 @@ def test_reduced_gaussian_shape_validation():
 
 @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
 def test_reduced_gaussian_validation_cache_and_restore_branches(monkeypatch):
-    import skybornspharm.reduced_gaussian as reduced_module
-
-    cache = {}
-    first = np.array([1.0], dtype=np.float32)
-    reduced_module._cache_basis_array(cache, (1, 1), first, max_entries=1)
-    reduced_module._cache_basis_array(
-        cache, (1, 1), np.array([2.0], dtype=np.float32), max_entries=1
-    )
-    assert cache[(1, 1)] is first
-    reduced_module._cache_basis_array(
-        cache, (2, 2), np.array([3.0], dtype=np.float32), max_entries=1
-    )
-    assert (1, 1) not in cache
-
-    reduced_module._GLOBAL_GAUSSIAN_GEOMETRY_CACHE.pop(7, None)
-    geometry = reduced_module._cached_gaussian_geometry(7)
-    cached_geometry = reduced_module._cached_gaussian_geometry(7)
-    assert cached_geometry[0] is geometry[0]
-    assert cached_geometry[1] is geometry[1]
-
     with pytest.raises(ValueError, match="rank 1"):
         ReducedGaussianSpharmt(np.array([[8, 8, 8]], dtype=np.int32))
     with pytest.raises(ValueError, match="at least 3 rows"):
@@ -417,66 +381,13 @@ def test_reduced_gaussian_basis_error_and_fallback_branches(monkeypatch):
     import skybornspharm.reduced_gaussian as reduced_module
 
     pl = np.array([8, 10, 8], dtype=np.int32)
-    reduced = ReducedGaussianSpharmt(pl)
-    key = (reduced.nlat, 1)
-
-    reduced_module._GLOBAL_BASIS_CACHE.pop(key, None)
     monkeypatch.setattr(
-        reduced_module._spherepack,
-        "reduced_gaussian_legendre_basis",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("basis boom")),
+        reduced_module._spharm_rs,
+        "RustReducedSpharmCore",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("core init boom")),
     )
-    with pytest.raises(SpheremackError, match="Legendre setup failed"):
-        reduced._basis(1)
-
-    monkeypatch.setattr(
-        reduced_module._spherepack,
-        "reduced_gaussian_legendre_basis",
-        lambda *args: (np.zeros((1, 1), dtype=np.float32), 7),
-    )
-    with pytest.raises(SpheremackError, match="error code 7"):
-        reduced._basis(1)
-
-    cached = np.ones((1, 1), dtype=np.float32, order="F")
-    reduced._basis_cache[1] = cached
-    assert reduced._basis(1) is cached
-
-    dbasis = np.ones((1, 1), dtype=np.float32, order="F")
-    reduced._dbasis_cache[1] = dbasis
-    assert reduced._dbasis(1) is dbasis
-
-    reduced._dbasis_cache.clear()
-    reduced_module._GLOBAL_DBASIS_CACHE.pop(key, None)
-    monkeypatch.setattr(reduced, "_basis", lambda ntrunc: cached)
-    monkeypatch.setattr(
-        reduced_module,
-        "_HAS_REDUCED_GAUSSIAN_LEGENDRE_DERIVATIVE_FROM_BASIS",
-        False,
-    )
-    monkeypatch.setattr(
-        reduced_module._spherepack,
-        "reduced_gaussian_legendre_derivative_basis",
-        lambda *args: (dbasis, 0),
-    )
-    assert reduced._dbasis(1).shape == dbasis.shape
-
-    reduced._dbasis_cache.clear()
-    reduced_module._GLOBAL_DBASIS_CACHE.pop(key, None)
-    monkeypatch.setattr(
-        reduced_module._spherepack,
-        "reduced_gaussian_legendre_derivative_basis",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("dbasis boom")),
-    )
-    with pytest.raises(SpheremackError, match="derivative setup failed"):
-        reduced._dbasis(1)
-
-    monkeypatch.setattr(
-        reduced_module._spherepack,
-        "reduced_gaussian_legendre_derivative_basis",
-        lambda *args: (dbasis, 8),
-    )
-    with pytest.raises(SpheremackError, match="error code 8"):
-        reduced._dbasis(1)
+    with pytest.raises(SpheremackError, match="RustReducedSpharmCore initialization failed"):
+        ReducedGaussianSpharmt(pl)
 
 
 @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")
@@ -489,112 +400,65 @@ def test_reduced_gaussian_native_wrapper_error_branches(monkeypatch):
     nspec = (ntrunc + 1) * (ntrunc + 2) // 2
     grid = np.zeros((reduced.npoints, 2), dtype=np.float32, order="F")
     spec = np.zeros((nspec, 2), dtype=np.complex64, order="F")
-    out_grid = np.zeros_like(grid)
-    out_spec = np.zeros_like(spec)
-    pair_out = (out_grid, out_grid.copy(order="F"))
-    grad_pair_out = (
-        out_grid,
-        out_grid.copy(order="F"),
-        out_grid.copy(order="F"),
-        out_grid.copy(order="F"),
-    )
-
-    monkeypatch.setattr(reduced, "_basis", lambda n: np.ones((1, 1), dtype=np.float32))
-    monkeypatch.setattr(
-        reduced, "_basis_transposed", lambda n: np.ones((1, 1), dtype=np.float32)
-    )
-    monkeypatch.setattr(
-        reduced, "_dbasis_transposed", lambda n: np.ones((1, 1), dtype=np.float32)
-    )
 
     cases = [
+        ("grdtospec", lambda: reduced._analyze_scalar(grid, ntrunc), "grdtospec"),
+        ("spectogrd", lambda: reduced._synthesize_scalar(spec, ntrunc), "spectogrd"),
         (
-            "reduced_gaussian_grdtospec",
-            lambda: reduced._analyze_scalar(grid, ntrunc),
-            "grdtospec",
-            (out_spec,),
-        ),
-        (
-            "reduced_gaussian_spectogrd",
-            lambda: reduced._synthesize_scalar(spec, ntrunc),
-            "spectogrd",
-            (out_grid,),
-        ),
-        (
-            "reduced_gaussian_spectogrd_pair",
+            "spectogrd_pair",
             lambda: reduced._synthesize_scalar_pair(spec, spec, ntrunc),
             "paired spectogrd",
-            pair_out,
         ),
         (
-            "reduced_gaussian_getvrtdivspec",
+            "getvrtdivspec",
             lambda: reduced._analyze_wind(grid, grid, ntrunc),
             "vector analysis",
-            (out_spec, out_spec.copy(order="F")),
         ),
         (
-            "reduced_gaussian_getvrtspec",
+            "getvrtspec",
             lambda: reduced._analyze_vorticity(grid, grid, ntrunc),
             "vorticity analysis",
-            (out_spec,),
         ),
         (
-            "reduced_gaussian_getdivspec",
+            "getdivspec",
             lambda: reduced._analyze_divergence(grid, grid, ntrunc),
             "divergence analysis",
-            (out_spec,),
         ),
         (
-            "reduced_gaussian_getgrad",
+            "getgrad",
             lambda: reduced._synthesize_gradient(spec, ntrunc),
             "gradient synthesis",
-            pair_out,
         ),
         (
-            "reduced_gaussian_getgrad_pair",
+            "getgrad_pair",
             lambda: reduced._synthesize_gradient_pair(spec, spec, ntrunc),
             "paired gradient synthesis",
-            grad_pair_out,
         ),
     ]
 
-    for func_name, call, message, outputs in cases:
-        monkeypatch.setattr(
-            reduced_module._spherepack,
-            func_name,
-            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
-        )
+    for method_name, call, message in cases:
+        real_core = reduced._core
+
+        class FailingCore:
+            def __getattr__(self, name):
+                if name == method_name:
+                    return lambda *args, **kwargs: (_ for _ in ()).throw(
+                        RuntimeError("boom")
+                    )
+                return getattr(real_core, name)
+
+        monkeypatch.setattr(reduced, "_core", FailingCore())
         with pytest.raises(SpheremackError, match=message):
             call()
+        monkeypatch.setattr(reduced, "_core", real_core)
 
-        monkeypatch.setattr(
-            reduced_module._spherepack,
-            func_name,
-            lambda *args, _outputs=outputs, **kwargs: (*_outputs, 9),
-        )
-        with pytest.raises(SpheremackError, match="error code 9"):
-            call()
-
-    monkeypatch.setattr(reduced_module, "_HAS_REDUCED_GAUSSIAN_SPECTOGRD_PAIR", False)
-    scalar_calls = {"count": 0}
-
-    def fake_scalar(normalized, ntrunc_arg):
-        scalar_calls["count"] += 1
-        return np.zeros((reduced.npoints, normalized.shape[1]), dtype=np.float32)
-
-    monkeypatch.setattr(reduced, "_synthesize_scalar", fake_scalar)
-    reduced._synthesize_scalar_pair(spec, spec, ntrunc)
-    assert scalar_calls["count"] == 2
-
-    monkeypatch.setattr(reduced_module, "_HAS_REDUCED_GAUSSIAN_GETGRAD", False)
     monkeypatch.setattr(
-        reduced_module._spherepack,
-        "reduced_gaussian_getgrad_pair",
-        lambda *args: (*grad_pair_out, 0),
+        reduced_module._spharm_rs,
+        "invlap",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("invlap boom")),
     )
-    ugrad, vgrad = reduced._synthesize_gradient(spec, ntrunc)
-    assert ugrad.shape == out_grid.shape
-    assert vgrad.shape == out_grid.shape
+    with pytest.raises(SpheremackError, match="invlap"):
+        reduced._invlap(spec)
 
 
 @pytest.mark.skipif(not SPHARM_AVAILABLE, reason="spharm module not available")

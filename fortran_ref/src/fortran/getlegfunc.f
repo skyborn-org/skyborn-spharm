@@ -1,3 +1,7 @@
+c [KNOWN HISTORICAL BUG] Calls single-precision `alfk` inside O(N^2) loop,
+c triggering both O(N^3) runtime and silent real32 underflow-to-zero for n >= 149
+c (e.g. Addition Theorem error ~169 at ntrunc=319). Fixed in ../getlegfunc.f90
+c and superseded by `rust/spharm-math/src/legendre.rs`.
       subroutine getlegfunc(legfunc,lat,ntrunc)
       integer ntrunc,m,n,nmstrt
       real lat,theta,pi,
