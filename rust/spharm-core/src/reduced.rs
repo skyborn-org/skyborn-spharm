@@ -1,3 +1,70 @@
+//! Packed reduced-Gaussian grid scalar and vector spherical-harmonic transforms.
+//!
+//! Derived from NCAR SPHEREPACK 3.2 (J. Adams and P. Swarztrauber), see LICENSE.spherepack.
+//!
+//! This module is the Rust port of the direct transforms for packed reduced Gaussian
+//! grids in `fortran_ref/src/reduced_gaussian_scalar.f90` (C entry points in
+//! `reduced_bindings.f90`). As in the Fortran, the spectral coefficient convention is the
+//! same as the existing Spharmt Gaussian backend, but the rectangular longitude FFT is
+//! replaced by a row-wise real FFT over each reduced latitude circle (length `pl[j]`).
+//!
+//! # Grid and spectral layout
+//!
+//! - `pl[j]` is the number of longitudes on latitude ring `j`; rings are ordered north to
+//!   south (`j = 0` is the northernmost Gaussian latitude, `j = nlat - 1` the southernmost).
+//! - A packed field holds `npoints = sum(pl)` values: ring 0 first, then ring 1, and so on
+//!   (Fortran `ngptot`, with `offsets(j + 1) = offsets(j) + pl(j)`).
+//! - Grid arrays are C-order `(nt, npoints)`, so field `k` is contiguous. This is the same
+//!   memory order as the Fortran `datagrid(ngptot, nt)`.
+//! - Spectral arrays are C-order `(nt, nmdim)` with `nmdim = (ntrunc + 1) * (ntrunc + 2) / 2`,
+//!   ordered by zonal wavenumber `m` and then total degree `n >= m`. The 0-based index is
+//!   `spectral_offset(m, ntrunc) + (n - m)`; the Fortran 1-based index is
+//!   `nm = m * (2 * ntrunc - m + 3) / 2 + n - m + 1`.
+//! - `south_to_north = true` means the packed buffer lists the rings from south to north
+//!   (ring order reversed, longitude order inside a ring unchanged); see `row_range`.
+//!
+//! # Algorithm
+//!
+//! - Analysis (`grdtospec`, `getvrtdivspec`): a real FFT of length `pl[j]` on every ring,
+//!   scaled by `1 / pl[j]`, keeps wavenumbers `m <= min(ntrunc, pl[j] / 2)`. A ring with
+//!   `2 * m > pl[j]` contributes nothing to wavenumber `m` (the Fortran test
+//!   `2 * m <= row_nlon`), which is equivalent to zero padding the ring spectrum to the common
+//!   Fourier truncation `ntrunc`. The Legendre analysis for each `m` then sums over rings with
+//!   the Gaussian weights `w_j` and the orthonormal associated Legendre functions
+//!   `P_n^m(cos theta_j)`.
+//! - Synthesis (`spectogrd`, `getgrad`): for each ring and each `m <= min(ntrunc, pl[j] / 2)`,
+//!   a Legendre sum over `n` gives the ring Fourier coefficient, and an inverse real FFT of
+//!   length `pl[j]` produces the ring values.
+//! - The Gaussian grid is symmetric about the equator, and
+//!   `P_n^m(-mu) = (-1)^(n - m) P_n^m(mu)`. When `pl` is symmetric (`pl[j] == pl[nlat - 1 - j]`)
+//!   the northern and southern rings of a pair are therefore combined into an even and an odd
+//!   part (sum and difference), split by the parity of `n - m`, so that each wavenumber needs
+//!   one matrix product per parity. The Fortran `spectogrd` and `getgrad` use the same
+//!   parity trick; the Fortran analysis routines loop over all rings instead.
+//! - When `pl` is not symmetric, every routine falls back to a per-field, per-ring loop.
+//!
+//! # Fortran counterparts
+//!
+//! - `reduced_gaussian_grdtospec` -> `ReducedEngine::grdtospec`
+//! - `reduced_gaussian_spectogrd` / `_spectogrd_pair` -> `spectogrd` / `spectogrd_pair`
+//! - `reduced_gaussian_getgrad` / `_getgrad_pair` -> `getgrad` / `getgrad_pair`
+//! - `reduced_gaussian_getvrtdivspec`, `_getvrtspec`, `_getdivspec` and
+//!   `_getvecspec_component` -> `getvrtdivspec` with `VectorMode::{VrtDiv, VrtOnly, DivOnly}`
+//! - `reduced_gaussian_build_fft_wsave` (`hrffti` tables per call) -> `FftCache` plans
+//! - `reduced_gaussian_legendre_basis` and `_legendre_derivative_basis` -> the parity-split
+//!   tables of `spharm_math::ReducedRowBasis` (`ensure_basis`, `ensure_dbasis`)
+//! - `getuv` has no direct Fortran counterpart in `reduced_gaussian_scalar.f90`.
+//!
+//! # Differences from Fortran
+//!
+//! - 0-based indexing, generic `f32`/`f64` storage (`TypedReducedBasis`); intermediate sums are
+//!   accumulated in `f64` where the Fortran uses `double precision`.
+//! - `rustfft`/`realfft` real FFTs (normalization applied explicitly) instead of `hrfftf`/`hrfftb`,
+//!   so the Fortran factors `2.0` and `0.5` that compensate the `hrfft` packing are not needed.
+//! - C-order `(nt, npoints)` and `(nt, nmdim)` layouts, a batch dimension `nt` handled in tiles,
+//!   `rayon` parallelism instead of OpenMP, and the `south_to_north` buffer-order flag.
+//! - The Gaussian weights, `sin(theta)` and Legendre bases come from `ReducedRowBasis` instead of
+//!   being passed in as arguments, and errors are returned as `Err(String)` instead of `ierror`.
 use std::sync::OnceLock;
 
 use faer::Accum;
@@ -10,23 +77,73 @@ use crate::engine::{compute_tile_size, FaerGemmFloat, VectorMode, PAR_WORK_THRES
 use crate::fft::FftCache;
 use crate::spectral::{apply_invlap_batch, nmdim_from_ntrunc, spectral_offset};
 
+/// Engine for scalar and vector transforms on one packed reduced Gaussian grid.
+///
+/// Holds the row lengths `pl` (north to south), the packed-buffer offsets, the sphere radius
+/// and lazily built per-precision Legendre bases and FFT plans.
+///
+/// Fortran: reduced_gaussian_scalar.f90 / reduced_gaussian_fft_cache_mod and the per-call
+/// setup in each `reduced_gaussian_*` subroutine (`offsets`, `symmetric_pl`, `pair_count`).
+///
+/// Difference from Fortran: the Fortran recomputes `offsets`, `symmetric_pl` and the FFT
+/// tables (`hrffti`) on every call and deliberately keeps no process-wide cache. Here the
+/// engine is built once; the Legendre basis (`OnceLock`) and the FFT plans per row length
+/// (`FftCache`) are created lazily and reused across calls.
 pub struct ReducedEngine {
+    /// Number of longitudes on each latitude ring, ordered north to south (Fortran `pl(nlat)`).
     pub pl: Vec<usize>,
+    /// Start of each ring in a north-to-south packed field, length `nlat + 1`
+    /// (Fortran `offsets(nlat + 1)`: `offsets(1) = 0`, `offsets(j + 1) = offsets(j) + pl(j)`).
     pub offsets: Vec<usize>,
+    /// Same as `offsets` but accumulated over the rings in reverse order (south to north);
+    /// used when the packed buffer is stored south to north. No direct Fortran counterpart.
     pub s2n_offsets: Vec<usize>,
+    /// Number of Gaussian latitude rings (Fortran `nlat`).
     pub nlat: usize,
+    /// Total number of grid points per field, `sum(pl)` (Fortran `ngptot` / `total`).
     pub npoints: usize,
+    /// Sphere radius used to scale gradients, vorticity and divergence (Fortran `rsphere`).
     pub rsphere: f64,
+    /// Legendre-function mode label, validated to be `stored` or `computed` in `new`.
+    /// No direct Fortran counterpart; it is not read elsewhere in this file.
     pub legfunc: String,
+    /// True when `pl[j] == pl[nlat - 1 - j]` for every north/south ring pair
+    /// (Fortran `symmetric_pl`); enables the even/odd (parity) fast path.
     pub symmetric_pl: bool,
+    /// True when `pl` is non-decreasing over the northern-hemisphere rings (`pl[j] >= pl[j - 1]`).
+    /// No direct Fortran counterpart; it allows skipping the rings with `2 * m > pl[j]` through
+    /// `first_pair_for_m` (compare the Fortran `first_pair_for_m(0:ntrunc)` in `getvrtdivspec`).
     pub is_nh_monotonic: bool,
+    // Lazily built Legendre row bases (Gaussian weights, sin(theta), parity-split P and dP/dtheta)
+    // for each storage precision, and FFT plan caches for each precision.
     basis_f32: OnceLock<ReducedRowBasis<f32>>,
     basis_f64: OnceLock<ReducedRowBasis<f64>>,
     fft_f32: FftCache<f32>,
     fft_f64: FftCache<f64>,
 }
 
+/// Construction, ring-offset helpers and the packed reduced-Gaussian transforms.
 impl ReducedEngine {
+    /// Validate the row lengths and build the packed-buffer offset tables.
+    ///
+    /// # Arguments
+    /// - `pl`: points per latitude ring, north to south (Fortran `pl(nlat)`); `nlat = pl.len()`.
+    /// - `rsphere`: sphere radius, must be positive and finite (Fortran `rsphere`).
+    /// - `legfunc`: `stored` or `computed`.
+    ///
+    /// # Errors
+    /// - `pl.len() < 3` (Fortran `ierror = 1`, `nlat < 3`).
+    /// - any `pl[j] < 4`.
+    /// - `rsphere <= 0` or not finite (Fortran `ierror = 4` or `5` in the vector routines).
+    /// - `legfunc` is neither `stored` nor `computed`.
+    ///
+    /// Fortran: reduced_gaussian_scalar.f90 / per-call setup of reduced_gaussian_grdtospec
+    /// (`offsets`, `total`, `max_nlon`) and reduced_gaussian_spectogrd (`symmetric_pl`, `pair_count`).
+    ///
+    /// Difference from Fortran: the Fortran only rejects `pl(j) < 1` and `nlat < 3` per call; this
+    /// constructor requires `pl[j] >= 4` and checks `rsphere` once. The check `total == ngptot`
+    /// (Fortran `ierror = 4`, `5` or `6` depending on the routine) is not repeated per call here;
+    /// the grid arrays passed to the transforms are expected to have `npoints` columns.
     pub fn new(pl: Vec<usize>, rsphere: f64, legfunc: String) -> Result<Self, String> {
         if pl.len() < 3 {
             return Err(format!("pl must contain at least 3 rows, got {}", pl.len()));
@@ -43,11 +160,14 @@ impl ReducedEngine {
             ));
         }
 
+        // Ring-pair bookkeeping, as in the Fortran `pair_count = nlat / 2` and the loop that clears
+        // `symmetric_pl` when `pl(j) /= pl(nlat - j + 1)`.
         let nlat = pl.len();
         let pair_count = nlat / 2;
         let symmetric_pl = (0..pair_count).all(|j| pl[j] == pl[nlat - 1 - j]);
         let is_nh_monotonic = (1..pair_count).all(|j| pl[j] >= pl[j - 1]);
 
+        // Packed-buffer offsets, same values as the Fortran `offsets(1) = 0; offsets(j + 1) = total`.
         let mut offsets = Vec::with_capacity(nlat + 1);
         offsets.push(0);
         let mut total = 0usize;
@@ -56,6 +176,8 @@ impl ReducedEngine {
             offsets.push(total);
         }
 
+        // Offsets for a south-to-north packed buffer (rings visited in reverse order).
+        // No direct Fortran counterpart.
         let mut s2n_offsets = Vec::with_capacity(nlat + 1);
         s2n_offsets.push(0);
         let mut s2n_total = 0usize;
@@ -81,16 +203,35 @@ impl ReducedEngine {
         })
     }
 
+    /// Legendre row basis for precision `T` (Gaussian weights, sin(theta) and the parity-split
+    /// P and dP/dtheta tables), built on first use.
+    ///
+    /// No direct Fortran counterpart; the Fortran passes `weights`, `basis`, `dbasis` and
+    /// `sin_theta` as arguments (see reduced_gaussian_legendre_basis and
+    /// reduced_gaussian_legendre_derivative_basis).
     #[inline]
     fn basis<T: TypedReducedBasis>(&self) -> &ReducedRowBasis<T> {
         T::get_basis(self)
     }
 
+    /// Cached real-FFT plans for precision `T`, keyed by ring length.
+    ///
+    /// Fortran: reduced_gaussian_build_fft_wsave (`hrffti` tables for each ring).
+    /// Difference from Fortran: plans are cached in the engine, not rebuilt per call.
     #[inline]
     fn fft<T: TypedReducedBasis>(&self) -> &FftCache<T> {
         T::get_fft(self)
     }
 
+    /// Start offset and length of ring `j_n2s` inside a packed field.
+    ///
+    /// - `j_n2s`: ring index counted north to south (0 = northernmost).
+    /// - `south_to_north`: when false the buffer is stored north to south and the offset is
+    ///   `offsets[j_n2s]`; when true the buffer is stored south to north and the ring starts at
+    ///   `s2n_offsets[nlat - 1 - j_n2s]`.
+    ///
+    /// Returns `(offset, pl[j_n2s])`. No direct Fortran counterpart (the Fortran always reads
+    /// `offsets(j)` of a north-to-south buffer).
     #[inline]
     fn row_range(&self, j_n2s: usize, south_to_north: bool) -> (usize, usize) {
         if !south_to_north {
@@ -101,6 +242,42 @@ impl ReducedEngine {
         }
     }
 
+    /// Grid to spectral transform of scalar fields on a packed reduced Gaussian grid.
+    ///
+    /// For every field and every ring a real FFT of length `pl[j]` is taken and the Fourier
+    /// coefficients with `m <= min(ntrunc, pl[j] / 2)` are kept. The Legendre analysis for each
+    /// wavenumber `m` then sums over rings with Gaussian weights:
+    ///
+    /// ```text
+    /// a_n^m = sum_j (w_j / pl[j]) * c_m(j) * P_n^m(cos theta_j)
+    /// ```
+    ///
+    /// where `c_m(j)` is the complex Fourier coefficient of ring `j` and a ring with
+    /// `2 * m > pl[j]` does not contribute to wavenumber `m`.
+    ///
+    /// # Arguments
+    /// - `grid`: input values, shape `(nt, npoints)` in C order, rings packed north to south
+    ///   (or south to north if `south_to_north`), longitudes in increasing order inside each ring.
+    /// - `out_spec`: output complex coefficients, at least `nt * nmdim` elements laid out as
+    ///   `(nt, nmdim)` with `nmdim = (ntrunc + 1) * (ntrunc + 2) / 2`; index `spectral_offset(m, ntrunc) + (n - m)`.
+    ///   It is zeroed first and fully overwritten.
+    /// - `ntrunc`: triangular truncation, `0 <= ntrunc <= nlat - 1`.
+    /// - `south_to_north`: ring order of the packed buffer, see `row_range`.
+    ///
+    /// # Errors
+    /// - `Err` if `ntrunc >= nlat` (Fortran `ierror = 2`), raised by the basis builder.
+    /// - `nt == 0` returns `Ok(())` without touching the output (Fortran `ierror = 3`, `nt < 1`).
+    /// - `out_spec` shorter than `nt * nmdim` or a grid with fewer than `npoints` columns panics
+    ///   (Fortran `ierror = 4`, `total /= ngptot`).
+    ///
+    /// Fortran: reduced_gaussian_scalar.f90 / reduced_gaussian_grdtospec
+    ///
+    /// Difference from Fortran: the Fortran loops over all rings and fields with one `hrfftf` per
+    /// ring and accumulates `weights(j) * basis(j, nm)` in double precision. Here, for symmetric
+    /// `pl`, the north/south ring pairs are folded into sum (`n - m` even) and difference
+    /// (`n - m` odd) parts and each wavenumber is reduced with one GEMM per parity; non-symmetric
+    /// `pl` uses a direct per-ring loop (the Fortran algorithm). The `1 / pl[j]` scaling is
+    /// applied to the ring values before the FFT instead of to the FFT output.
     pub fn grdtospec<T: TypedReducedBasis>(
         &self,
         grid: &ndarray::ArrayView2<'_, T>,
@@ -108,13 +285,17 @@ impl ReducedEngine {
         ntrunc: usize,
         south_to_north: bool,
     ) -> Result<(), String> {
+        // Fortran validation order: nlat < 3 (1), ntrunc range (2), nt < 1 (3); see the `# Errors` section.
         let nt = grid.shape()[0];
         let nmdim = nmdim_from_ntrunc(ntrunc);
         if nt == 0 {
             return Ok(());
         }
+        // Fortran: `dataspec(:, :) = (0.0, 0.0)`.
         out_spec[..nt * nmdim].fill(T::complex_zero());
 
+        // Gaussian weights, parity-split Legendre tables and the ring-pair counts
+        // (`imid`, `imm1`, `pair_count`) for this `ntrunc`.
         let rb = self.basis::<T>();
         let basis_data = rb.ensure_basis(ntrunc)?;
         let imid = rb.imid;
@@ -122,12 +303,17 @@ impl ReducedEngine {
         let pair_count = rb.pair_count;
         let is_odd_nlat = self.nlat % 2 == 1;
         let mmax = ntrunc + 1;
+        // First ring pair that carries wavenumber `m` (Fortran `first_pair_for_m(m)`: the first `j`
+        // with `2 * m <= pl(j)`); earlier rings are skipped in the per-`m` products. Only valid when
+        // `pl` is symmetric and monotonic in the northern hemisphere, otherwise start at ring 0.
         let first_pair = if self.symmetric_pl && self.is_nh_monotonic {
             rb.first_pair_for_m(ntrunc)?
         } else {
             vec![0; mmax]
         };
 
+        // FFT plans per ring length (Fortran `reduced_gaussian_build_fft_wsave` followed by one
+        // `hrfftf` call per ring).
         let fft_cache = self.fft::<T>();
         let plans: Vec<_> = (0..imid)
             .map(|j| fft_cache.get_or_plan(self.pl[j]))
@@ -140,10 +326,14 @@ impl ReducedEngine {
                 .collect()
         };
 
+        // Fields are processed in tiles of `max_tile` to bound scratch memory.
+        // No Fortran counterpart (the Fortran handles one field `k` at a time).
         let per_field_bytes = (self.npoints + 2 * mmax * imid * 2) * T::BYTES;
         let max_tile = compute_tile_size(per_field_bytes, nt);
         let contiguous = grid.as_slice();
 
+        // Symmetric `pl`: fold ring pair (j, nlat - 1 - j) into even and odd parts, FFT each part,
+        // then Legendre-analyse each parity with one product per wavenumber `m`.
         if self.symmetric_pl {
             let mut f_even = vec![T::ZERO; mmax * imid * 2 * max_tile];
             let mut f_odd = vec![T::ZERO; mmax * imm1 * 2 * max_tile];
@@ -162,6 +352,11 @@ impl ReducedEngine {
                 fft_e_ki[..tile * imid * mmax].fill(T::complex_zero());
                 fft_o_ki[..tile * imm1 * mmax].fill(T::complex_zero());
 
+                // Step 1 (per field): for every ring pair form `(north +/- south) * w_j / pl[j]` and take its
+                // real FFT; keep `m = 0..=min(ntrunc, pl[j] / 2)`. The Fortran takes one FFT per ring and
+                // stores `cos_fft(m, j) = fft_rows(2 * m) / pl(j)` and `sin_fft(m, j) = fft_rows(2 * m + 1) / pl(j)`,
+                // with `sin_fft(0, j) = 0` and `sin_fft = 0` when `2 * m == pl(j)`; here the real and imaginary
+                // parts of the complex `r2c` output play the role of that cos/sin pair.
                 let do_fold = |(tk, (fe_k, fo_k)): (usize, (&mut [Complex<T>], &mut [Complex<T>]))| {
                     let k = start + tk;
                     let mut real_e = vec![T::ZERO; rb.max_nlon];
@@ -173,6 +368,7 @@ impl ReducedEngine {
                         let row_nlon = self.pl[j];
                         let (off_n, _) = self.row_range(j, south_to_north);
                         let (off_s, _) = self.row_range(self.nlat - 1 - j, south_to_north);
+                        // Gaussian weight times `1 / pl[j]` (Fortran `inv_nlon` and `weights(j)`).
                         let scale = T::from_real(rb.weights_f64[j] / (row_nlon as f64));
 
                         if let Some(sl) = contiguous {
@@ -193,6 +389,7 @@ impl ReducedEngine {
                             }
                         }
 
+                        // Real FFT of the even part, then of the odd part (`nfreq = pl / 2 + 1` coefficients).
                         let nfreq = row_nlon / 2 + 1;
                         let mlimit = ntrunc.min(row_nlon / 2);
                         let r2c = &plans[j].r2c;
@@ -219,6 +416,8 @@ impl ReducedEngine {
                             .copy_from_slice(&cpx_buf[..mlimit + 1]);
                     }
 
+                    // Odd `nlat`: the equatorial ring has no partner and is purely even, so it only enters the
+                    // even part (Fortran `half_nlat > pair_count`).
                     if is_odd_nlat {
                         let j = imid - 1;
                         let row_nlon = self.pl[j];
@@ -265,6 +464,8 @@ impl ReducedEngine {
                         .for_each(do_fold);
                 }
 
+                // Step 2: repack the Fourier coefficients per wavenumber `m` as real matrices
+                // `(ring, 2 * tile)` (re, im interleaved) so each `m` is one matrix product.
                 let fe_m_stride = imid * cols;
                 let fo_m_stride = imm1 * cols;
                 let do_pack = |(m, (fe_m, fo_m)): (usize, (&mut [T], &mut [T]))| {
@@ -299,6 +500,9 @@ impl ReducedEngine {
                         .for_each(do_pack);
                 }
 
+                // Step 3: Legendre analysis. For every `m`, `spec_even = P_even^T * f_even` covers the
+                // `n - m` even degrees; `P_odd^T * f_odd` below covers the `n - m` odd degrees.
+                // Rings before `first_pair[m]` have `2 * m > pl[j]` and are skipped.
                 let spec_m_stride = max_rows * cols;
                 let do_gemm_e = |(m, spec_m): (usize, &mut [T])| {
                     let ne = basis_data.p_even.rows_for_m(m, ntrunc);
@@ -327,6 +531,8 @@ impl ReducedEngine {
                         .for_each(do_gemm_e);
                 }
 
+                // Scatter the even-degree results into `out_spec` at `spectral_offset(m, ntrunc) + 2 * r`
+                // (Fortran `dataspec(nm, k)`, `n = m, m + 2, ...`).
                 for m in 0..mmax {
                     let ne = basis_data.p_even.rows_for_m(m, ntrunc);
                     if ne > 0 {
@@ -370,6 +576,8 @@ impl ReducedEngine {
                         .for_each(do_gemm_o);
                 }
 
+                // Scatter the odd-degree results into `out_spec` at `spectral_offset(m, ntrunc) + 1 + 2 * r`
+                // (Fortran `n = m + 1, m + 3, ...`).
                 for m in 0..mmax {
                     let no = basis_data.p_odd.rows_for_m(m, ntrunc);
                     if no > 0 {
@@ -390,6 +598,10 @@ impl ReducedEngine {
             }
         } else {
             // Non-symmetric pl fallback
+            // This branch is the Fortran algorithm: one FFT per ring scaled by `1 / pl(j)`, then for each
+            // `m` with `2 * m <= pl(j)` accumulate `weights(j) * basis(j, nm)` times the ring coefficient
+            // into `dataspec(nm, k)`. The southern rings use the parity sign `(-1)^(n - m)` that the
+            // Fortran stores in `basis(js, nm) = parity * value`.
             let nlat = self.nlat;
             out_spec[..nt * nmdim]
                 .par_chunks_mut(nmdim)
@@ -438,6 +650,7 @@ impl ReducedEngine {
                         let pe = basis_data.p_even.block_for_m(m, ntrunc);
                         let po = basis_data.p_odd.block_for_m(m, ntrunc);
                         for j in 0..nlat {
+                            // Fortran: `if (2 * m <= row_nlon)`; rings too short for wavenumber `m` are skipped.
                             if 2 * m > self.pl[j] {
                                 continue;
                             }
@@ -468,6 +681,36 @@ impl ReducedEngine {
         Ok(())
     }
 
+    /// Spectral to grid transform of scalar fields onto a packed reduced Gaussian grid.
+    ///
+    /// For every ring `j` and wavenumber `m <= min(ntrunc, pl[j] / 2)` the ring Fourier
+    /// coefficient is the Legendre sum over degrees,
+    ///
+    /// ```text
+    /// c_m(j) = sum_{n = m}^{ntrunc} a_n^m * P_n^m(cos theta_j)
+    /// ```
+    ///
+    /// and an inverse real FFT of length `pl[j]` gives the ring values.
+    ///
+    /// # Arguments
+    /// - `spec`: complex coefficients, shape `(nt, nmdim)` in C order, `nmdim = (ntrunc + 1) * (ntrunc + 2) / 2`.
+    /// - `out_grid`: output, at least `nt * npoints` elements laid out as `(nt, npoints)`, rings packed
+    ///   north to south (or south to north if `south_to_north`); fully overwritten.
+    /// - `ntrunc`: triangular truncation, `0 <= ntrunc <= nlat - 1`.
+    /// - `south_to_north`: ring order of the packed buffer, see `row_range`.
+    ///
+    /// # Errors
+    /// - `Err` if `ntrunc >= nlat` (Fortran `ierror = 2`).
+    /// - `nt == 0` returns `Ok(())` (Fortran `ierror = 4`, `nt < 1`).
+    /// - a spectral array whose second dimension differs from `nmdim` (Fortran `ierror = 3`) or an
+    ///   output buffer that is too short (Fortran `ierror = 5`) is not reported as an error here;
+    ///   it panics on out-of-range indexing.
+    ///
+    /// Fortran: reduced_gaussian_scalar.f90 / reduced_gaussian_spectogrd
+    ///
+    /// Difference from Fortran: implemented through `spectogrd_batch` (shared with
+    /// `spectogrd_pair`); see that function for the per-parity products. The imaginary part of the
+    /// `m = 0` coefficient is ignored, as in the Fortran, which never reads it.
     pub fn spectogrd<T: TypedReducedBasis>(
         &self,
         spec: &ndarray::ArrayView2<'_, Complex<T>>,
@@ -478,6 +721,20 @@ impl ReducedEngine {
         self.spectogrd_batch(spec, None, out_grid, None, ntrunc, south_to_north)
     }
 
+    /// Spectral to grid transform of two scalar fields (a and b) in a single pass.
+    ///
+    /// Same algorithm and layout as `spectogrd`; the two batches share the Legendre products and
+    /// the FFT loop (the two fields are stacked as extra columns).
+    ///
+    /// # Arguments
+    /// - `spec_a`, `spec_b`: coefficients, each `(nt, nmdim)` in C order.
+    /// - `out_a`, `out_b`: outputs, each at least `nt * npoints` elements, `(nt, npoints)` layout.
+    /// - `ntrunc`, `south_to_north`: as in `spectogrd`.
+    ///
+    /// # Errors
+    /// As `spectogrd`; `Err` if `ntrunc >= nlat`, and `Ok(())` for `nt == 0`.
+    ///
+    /// Fortran: reduced_gaussian_scalar.f90 / reduced_gaussian_spectogrd_pair
     pub fn spectogrd_pair<T: TypedReducedBasis>(
         &self,
         spec_a: &ndarray::ArrayView2<'_, Complex<T>>,
@@ -497,6 +754,25 @@ impl ReducedEngine {
         )
     }
 
+    /// Shared implementation of `spectogrd` and `spectogrd_pair`; `spec_b`/`out_b` are `None` for a
+    /// single field.
+    ///
+    /// For symmetric `pl` each wavenumber `m` is synthesised separately for even and odd `n - m`:
+    ///
+    /// ```text
+    /// f_even(j, m) = sum_{n - m even} a_n^m P_n^m(j)     (rings j in the northern half)
+    /// f_odd(j, m)  = sum_{n - m odd}  a_n^m P_n^m(j)
+    /// north ring j: f_even + f_odd,   south ring nlat - 1 - j: f_even - f_odd
+    /// ```
+    ///
+    /// The ring coefficients are then inverse-transformed with a complex-to-real FFT of length
+    /// `pl[j]`. The Fortran does the same with the two sums `scrm_real` / `scrm_real_s`
+    /// (the south sum flips the sign of the odd-`n - m` terms).
+    ///
+    /// Fortran: reduced_gaussian_scalar.f90 / reduced_gaussian_spectogrd and reduced_gaussian_spectogrd_pair
+    /// Difference from Fortran: rows are produced with `rustfft`/`realfft` `c2r` (no `2.0` and `0.5`
+    /// factors, which only compensate `hrfftb` packing), and the pair case stacks field b after field a
+    /// in the matrix columns (`idx = tile + tk`).
     fn spectogrd_batch<T: TypedReducedBasis>(
         &self,
         spec_a: &ndarray::ArrayView2<'_, Complex<T>>,
@@ -532,6 +808,7 @@ impl ReducedEngine {
                 .collect()
         };
 
+        // Symmetric `pl` (Fortran `symmetric_pl` branch over `pair_count` ring pairs).
         if self.symmetric_pl {
             let per_field_bytes = (self.npoints + 2 * mmax * imid * 2) * T::BYTES * nfields_per_k;
             let max_tile = compute_tile_size(per_field_bytes, nt);
@@ -552,6 +829,8 @@ impl ReducedEngine {
                 let par_fields = eff_t >= 2 && eff_t * self.npoints >= PAR_WORK_THRESHOLD;
                 let par_m = mmax * imid * cols >= PAR_WORK_THRESHOLD;
 
+                // Per `m`: pack the coefficients with `n - m` even and multiply by `P_even` to get the
+                // even ring part. The imaginary part of the `m = 0` coefficient is set to zero.
                 let do_syn_even = |(m, (fe_m, spec_m)): (usize, (&mut [T], &mut [T]))| {
                     let ne = basis_data.p_even.rows_for_m(m, ntrunc);
                     if ne == 0 || imid == 0 {
@@ -591,6 +870,8 @@ impl ReducedEngine {
                         .for_each(do_syn_even);
                 }
 
+                // Per `m`: pack the coefficients with `n - m` odd and multiply by `P_odd` to get the
+                // odd ring part (equatorially antisymmetric).
                 let do_syn_odd = |(m, (fo_m, spec_m)): (usize, (&mut [T], &mut [T]))| {
                     let no = basis_data.p_odd.rows_for_m(m, ntrunc);
                     if no == 0 || imm1 == 0 {
@@ -635,6 +916,9 @@ impl ReducedEngine {
                     .as_deref_mut()
                     .map(|sl| sl[start * self.npoints..(start + tile) * self.npoints].as_mut_ptr() as usize);
 
+                // Per field: combine the parts into the north and south ring spectra
+                // (north = even + odd, south = even - odd; Fortran `scrm_real` and `scrm_real_s`) and run
+                // the inverse real FFT of each ring straight into the output buffer.
                 let do_syn_c2r = |ek: usize| {
                     let is_b = ek >= tile;
                     let tk = if is_b { ek - tile } else { ek };
@@ -664,6 +948,8 @@ impl ReducedEngine {
                             cpx_n[m] = Complex::new(ge_re + go_re, ge_im + go_im);
                             cpx_s[m] = Complex::new(ge_re - go_re, ge_im - go_im);
                         }
+                        // A real signal has no imaginary part at wavenumber 0, nor at the Nyquist wavenumber when
+                        // `pl` is even (the Fortran only writes `fft_rows(2 * m + 1)` when `2 * m < row_nlon`).
                         cpx_n[0].im = T::ZERO;
                         cpx_s[0].im = T::ZERO;
                         if row_nlon % 2 == 0 {
@@ -687,6 +973,7 @@ impl ReducedEngine {
                         }
                     }
 
+                    // Odd `nlat`: the equatorial ring is synthesised from the even part alone.
                     if is_odd_nlat {
                         let j = imid - 1;
                         let row_nlon = self.pl[j];
@@ -724,6 +1011,9 @@ impl ReducedEngine {
             }
         } else {
             // Non-symmetric pl fallback
+            // This branch is the Fortran algorithm for non-symmetric `pl`: a direct Legendre sum for
+            // every ring and `m` with `2 * m <= pl(j)`, then one inverse FFT per ring. Southern rings use
+            // the parity sign `(-1)^(n - m)` for odd degrees.
             let nlat = self.nlat;
             let synth_one = |spec: &ndarray::ArrayView2<'_, Complex<T>>, out: &mut [T]| {
                 out[..nt * self.npoints]
@@ -792,6 +1082,44 @@ impl ReducedEngine {
         Ok(())
     }
 
+    /// Vorticity and/or divergence spectra of a wind field given on a packed reduced Gaussian grid.
+    ///
+    /// For each field the wind components `u`, `v` are Fourier transformed ring by ring
+    /// (`U_m(j)`, `V_m(j)` with the factor `1 / pl[j]`) and projected on the Legendre functions
+    /// with Gaussian weights `w_j` and the sphere radius `R`:
+    ///
+    /// ```text
+    /// div_n^m = sum_j (w_j / R) * [ i m P_n^m(j) / sin(theta_j) * U_m(j) + dP_n^m/dtheta(j) * V_m(j) ]
+    /// vrt_n^m = sum_j (w_j / R) * [ i m P_n^m(j) / sin(theta_j) * V_m(j) - dP_n^m/dtheta(j) * U_m(j) ]
+    /// ```
+    ///
+    /// Rings with `2 * m > pl[j]` do not contribute to wavenumber `m`.
+    ///
+    /// # Arguments
+    /// - `ugrid`, `vgrid`: wind components, each `(nt, npoints)` in C order, rings packed north to south
+    ///   (or south to north if `south_to_north`).
+    /// - `out_vrt`, `out_div`: optional outputs, each at least `nt * nmdim` elements laid out as `(nt, nmdim)`;
+    ///   a requested output is zeroed first and filled, `None` outputs are skipped.
+    /// - `ntrunc`: triangular truncation, `0 <= ntrunc <= nlat - 1`.
+    /// - `south_to_north`: ring order of the packed buffer, see `row_range`.
+    /// - `mode`: `VrtDiv` (both), `VrtOnly` (vorticity) or `DivOnly` (divergence); selects which of
+    ///   the two projections are computed.
+    ///
+    /// # Errors
+    /// - `Err` if `ntrunc >= nlat` (Fortran `ierror = 2`).
+    /// - `nt == 0` returns `Ok(())` (Fortran `ierror = 3`, `nt < 1`).
+    /// - `rsphere <= 0` (Fortran `ierror = 4`) is rejected in `new`; `sin_theta <= 0` cannot occur for
+    ///   Gaussian latitudes; `total /= ngptot` (Fortran `ierror = 5`) is not checked here.
+    ///
+    /// Fortran: reduced_gaussian_scalar.f90 / reduced_gaussian_getvrtdivspec (mode `VrtDiv`),
+    /// reduced_gaussian_getvrtspec (`VrtOnly`) and reduced_gaussian_getdivspec (`DivOnly`), which
+    /// call reduced_gaussian_getvecspec_component with `component = 1` (vorticity) or `2` (divergence).
+    ///
+    /// Difference from Fortran: one routine with a `VectorMode` instead of four Fortran entry points.
+    /// `weight_inv_r[j] = w_j / R` and `weight_inv_r_sin[j] = w_j / (R sin(theta_j))` are folded into the
+    /// right-hand sides before the products, as in the Fortran. For symmetric `pl` the ring pairs are folded
+    /// into sum and difference parts (u and v each), because `P_n^m` is even or odd about the equator by
+    /// the parity of `n - m` while `dP_n^m/dtheta` has the opposite parity.
     pub fn getvrtdivspec<T: TypedReducedBasis>(
         &self,
         ugrid: &ndarray::ArrayView2<'_, T>,
@@ -829,6 +1157,8 @@ impl ReducedEngine {
             vec![0; mmax]
         };
 
+        // Fortran: `inv_r = 1 / rsphere`, `weight_inv_r(j) = weights(j) * inv_r` and
+        // `weight_inv_r_sin(j) = weight_inv_r(j) / sin_theta(j)`.
         let inv_r = 1.0 / self.rsphere;
         let weight_inv_r: Vec<f64> = rb.weights_f64.iter().map(|&w| w * inv_r).collect();
         let weight_inv_r_sin: Vec<f64> = weight_inv_r
@@ -854,6 +1184,8 @@ impl ReducedEngine {
         let want_vrt = matches!(mode, VectorMode::VrtDiv | VectorMode::VrtOnly);
         let want_div = matches!(mode, VectorMode::VrtDiv | VectorMode::DivOnly);
 
+        // Symmetric `pl`: tiles of fields, ring pairs folded into sum/difference parts
+        // (Fortran `symmetric_pl` branch with `first_pair_for_m` to skip rings with `2 * m > pl(j)`).
         if self.symmetric_pl {
             let per_field_bytes = (2 * self.npoints + 8 * mmax * imid * 2) * T::BYTES;
             let max_tile = compute_tile_size(per_field_bytes, nt);
@@ -889,6 +1221,10 @@ impl ReducedEngine {
                 v_diff_ki[..tile * imm1 * mmax].fill(T::complex_zero());
 
                 // Step 1: fold N/S u,v and run r2c
+                // Per field and ring pair: `u_sum = (u_north + u_south) / pl[j]`, `u_diff = (u_north - u_south) / pl[j]`
+                // and the same for `v`, each followed by a real FFT truncated to `m <= min(ntrunc, pl[j] / 2)`.
+                // Fortran: `reduced_gaussian_u_cos_fft`, `_u_sin_fft`, `_v_cos_fft`, `_v_sin_fft` hold the cosine
+                // and sine coefficients of each ring scaled by `inv_nlon`; here the complex FFT output is kept.
                 let do_vec_fold = |(tk, (((us_k, ud_k), vs_k), vd_k)): (
                     usize,
                     (((&mut [Complex<T>], &mut [Complex<T>]), &mut [Complex<T>]), &mut [Complex<T>]),
@@ -950,6 +1286,7 @@ impl ReducedEngine {
                         vd_k[j * mmax..j * mmax + mlimit + 1].copy_from_slice(&cpx_buf[..mlimit + 1]);
                     }
 
+                    // Odd `nlat`: the equatorial ring has no partner and only enters the sum (even) parts.
                     if is_odd_nlat {
                         let j = imid - 1;
                         let row_nlon = self.pl[j];
@@ -1002,6 +1339,18 @@ impl ReducedEngine {
                 }
 
                 // Step 2: pack RHS matrices
+                // Right-hand sides per wavenumber `m` (`i * m * w_j / (R sin(theta_j))` multiplies the `P` terms
+                // and `w_j / R` the `dP/dtheta` terms; `i x` maps `(re, im)` to `(-im, re)`):
+                //
+                // ```text
+                // div: (P_even, P_odd) side uses  i * m * w/(R sin) * U,   (dP) side uses   w/R * V
+                // vrt: (P_even, P_odd) side uses  i * m * w/(R sin) * V,   (dP) side uses  -w/R * U
+                // ```
+                //
+                // Matches the Fortran terms `div_real = p_weighted * u_sin + dp_weighted * v_cos`,
+                // `vrt_real = -dp_weighted * u_cos + p_weighted * v_sin` (and the imaginary parts).
+                // `P_even` pairs with the sum parts and `dP_even` with the difference parts, `P_odd` with the
+                // difference parts and `dP_odd` with the sum parts.
                 let imid_stride = imid * cols;
                 let imm1_stride = imm1 * cols;
                 let do_vec_pack = |(m, (((pe_m, dpe_m), po_m), dpo_m)): (
@@ -1097,6 +1446,8 @@ impl ReducedEngine {
                 }
 
                 // Step 3a: n - m EVEN GEMMs
+                // Step 3a (`n - m` even): `spec = P_even^T * rhs_pe + dP_even^T * rhs_dpe` for each `m`; for
+                // `m = 0` the `P` term vanishes (`p_scale = m * w / (R sin) = 0`).
                 let spec_m_stride = max_rows * cols;
                 let do_vec_even = |(m, spec_m): (usize, &mut [T])| {
                     let ne = basis_data.p_even.rows_for_m(m, ntrunc);
@@ -1149,6 +1500,7 @@ impl ReducedEngine {
                 );
 
                 // Step 3b: n - m ODD GEMMs
+                // `spec = dP_odd^T * rhs_dpo + P_odd^T * rhs_po` for each `m` (the `P` term is dropped for `m = 0`).
                 let do_vec_odd = |(m, spec_m): (usize, &mut [T])| {
                     let no = basis_data.p_odd.rows_for_m(m, ntrunc);
                     if no == 0 {
@@ -1199,6 +1551,9 @@ impl ReducedEngine {
             }
         } else {
             // Non-symmetric fallback
+            // Non-symmetric `pl`: Fortran algorithm. Per field, one FFT per ring, then for each `m` and ring
+            // with `2 * m <= pl(j)` add `w_j / R * [...]` to every `nm` using the formulas above.
+            // Southern rings use `P(south) = (-1)^(n - m) P(north)` and `dP/dtheta(south) = -(-1)^(n - m) dP/dtheta(north)`.
             let nlat = self.nlat;
             for k in 0..nt {
                 let mut r_u = vec![T::ZERO; rb.max_nlon];
@@ -1247,6 +1602,7 @@ impl ReducedEngine {
                         let vc = v_fft[j * mmax + m];
                         let is_south = j >= imid;
                         let j_nh = if is_south { nlat - 1 - j } else { j };
+                        // Fortran: `p_scale = m * weight_inv_r_sin(j)`, `dp_scale = weight_inv_r(j)`.
                         let p_sc = (m as f64) * weight_inv_r_sin[j];
                         let dp_sc = weight_inv_r[j];
                         let ure = uc.re.to_f64();
@@ -1306,6 +1662,38 @@ impl ReducedEngine {
         Ok(())
     }
 
+    /// Horizontal gradient of scalar spectral fields, evaluated on a packed reduced Gaussian grid.
+    ///
+    /// For a scalar `f` with coefficients `a_n^m` the two components returned are
+    ///
+    /// ```text
+    /// ugrad =  1 / (R sin(theta)) * df/dlambda        (zonal component)
+    /// vgrad = -1 / R              * df/dtheta         (meridional component, northward)
+    /// ```
+    ///
+    /// and on ring `j` their Fourier coefficients are
+    ///
+    /// ```text
+    /// U_m(j) =  i m / (R sin(theta_j)) * sum_n a_n^m P_n^m(cos theta_j)
+    /// V_m(j) = -1 / R * sum_n a_n^m dP_n^m/dtheta(theta_j)
+    /// ```
+    ///
+    /// with `U_0 = 0` and `V_0` real. The rings are then inverse-transformed (`c2r`, length `pl[j]`).
+    ///
+    /// # Arguments
+    /// - `spec`: coefficients, `(nt, nmdim)` in C order.
+    /// - `out_u`, `out_v`: outputs, each at least `nt * npoints` elements, `(nt, npoints)` layout.
+    /// - `ntrunc`, `south_to_north`: as in `spectogrd`.
+    ///
+    /// # Errors
+    /// - `Err` if `ntrunc >= nlat` (Fortran `ierror = 2`); `nt == 0` returns `Ok(())` (Fortran `ierror = 4`).
+    /// - `rsphere <= 0` (Fortran `ierror = 5`) is rejected in `new`; `nmdim` and `ngptot` mismatches
+    ///   (Fortran `ierror = 3` and `6`) are not reported here.
+    ///
+    /// Fortran: reduced_gaussian_scalar.f90 / reduced_gaussian_getgrad
+    ///
+    /// Difference from Fortran: implemented through `getgrad_batch`; the Fortran factors `two_inv_r`,
+    /// `two_inv_r_sin` and the final `0.5` (hrfftb packing) are not needed with `c2r`.
     pub fn getgrad<T: TypedReducedBasis>(
         &self,
         spec: &ndarray::ArrayView2<'_, Complex<T>>,
@@ -1317,6 +1705,19 @@ impl ReducedEngine {
         self.getgrad_batch(spec, None, out_u, out_v, None, None, ntrunc, south_to_north)
     }
 
+    /// Gradient of two scalar spectral fields (a and b) in one pass.
+    ///
+    /// Same formulas and layout as `getgrad`; the two fields share the Legendre products and the
+    /// FFT loop.
+    ///
+    /// # Arguments
+    /// - `spec_a`, `spec_b`: coefficients, each `(nt, nmdim)`.
+    /// - `out_au`, `out_av`: zonal and meridional gradient of a, each `(nt, npoints)`.
+    /// - `out_bu`, `out_bv`: zonal and meridional gradient of b, each `(nt, npoints)`.
+    /// - `ntrunc`, `south_to_north`: as in `getgrad`.
+    ///
+    /// Fortran: reduced_gaussian_scalar.f90 / reduced_gaussian_getgrad_pair
+    /// (`a_ugrad`, `a_vgrad`, `b_ugrad`, `b_vgrad`).
     pub fn getgrad_pair<T: TypedReducedBasis>(
         &self,
         spec_a: &ndarray::ArrayView2<'_, Complex<T>>,
@@ -1340,6 +1741,29 @@ impl ReducedEngine {
         )
     }
 
+    /// Wind components from vorticity and divergence spectra on a packed reduced Gaussian grid.
+    ///
+    /// The streamfunction and velocity potential are obtained with the inverse Laplacian,
+    /// `psi = invlap(vrt)` and `chi = invlap(div)` (radius `rsphere`), and the wind is
+    ///
+    /// ```text
+    /// u = ugrad(chi) - vgrad(psi)
+    /// v = vgrad(chi) + ugrad(psi)
+    /// ```
+    ///
+    /// where `ugrad`/`vgrad` are the gradient components of `getgrad`. This is computed with one
+    /// `getgrad_batch` call on the pair `(chi, psi)`.
+    ///
+    /// # Arguments
+    /// - `vrtspec`, `divspec`: vorticity and divergence coefficients, each `(nt, nmdim)`.
+    /// - `out_u`, `out_v`: wind components, each at least `nt * npoints` elements, `(nt, npoints)` layout.
+    /// - `ntrunc`, `south_to_north`: as in `getgrad`.
+    ///
+    /// # Errors
+    /// - `Err` if `ntrunc >= nlat`; `nt == 0` returns `Ok(())`.
+    ///
+    /// No direct Fortran counterpart in reduced_gaussian_scalar.f90 or reduced_bindings.f90 (the Fortran
+    /// module has `getgrad`, `getgrad_pair` and the invlap routine separately; see invlap.f90).
     pub fn getuv<T: TypedReducedBasis>(
         &self,
         vrtspec: &ndarray::ArrayView2<'_, Complex<T>>,
@@ -1356,6 +1780,7 @@ impl ReducedEngine {
         }
         // Compute psispec = invlap(vrtspec), chispec = invlap(divspec) into compact buffers,
         // then run getgrad_pair(chispec, psispec) and combine u = u_chi - u_psi, v = v_chi + v_psi.
+        // Copy the (possibly strided) input views into contiguous `(nt, nmdim)` buffers for `apply_invlap_batch`.
         let mut vrt_c = Vec::with_capacity(nt * nmdim);
         let mut div_c = Vec::with_capacity(nt * nmdim);
         for k in 0..nt {
@@ -1416,6 +1841,25 @@ impl ReducedEngine {
         Ok(())
     }
 
+    /// Shared implementation of `getgrad` and `getgrad_pair`; `spec_b`, `out_bu` and `out_bv` are `None`
+    /// for a single field.
+    ///
+    /// For symmetric `pl` the parity-split products give, per wavenumber `m` and ring pair,
+    ///
+    /// ```text
+    /// sp  = sum_n a_n^m P_n^m(j)             (even and odd n - m parts)
+    /// sdp = sum_n a_n^m dP_n^m/dtheta(j)     (even and odd n - m parts)
+    /// north: P = Pe + Po,  dP = dPe + dPo
+    /// south: P = Pe - Po,  dP = dPo - dPe
+    /// ```
+    ///
+    /// because `P_n^m` has the parity of `n - m` about the equator and `dP_n^m/dtheta` the opposite one.
+    /// The ring spectra are `U_m = i m / (R sin theta) * P` and `V_m = -dP / R` (see `getgrad`).
+    ///
+    /// Fortran: reduced_gaussian_scalar.f90 / reduced_gaussian_getgrad and reduced_gaussian_getgrad_pair
+    /// (`sum_p_*`, `sum_dp_*`, `sum_p_*_s`, `sum_dp_*_s` with the southern signs flipped).
+    /// Difference from Fortran: `c2r` replaces `hrfftb`; the pair case stacks field b after field a
+    /// in the matrix columns (`idx = tile + tk`).
     #[allow(clippy::too_many_arguments)]
     fn getgrad_batch<T: TypedReducedBasis>(
         &self,
@@ -1458,6 +1902,7 @@ impl ReducedEngine {
         };
 
         if self.symmetric_pl {
+            // Tile size bound for scratch memory; `nfields_per_k` is 2 for the pair variant.
             let per_field_bytes = (2 * self.npoints + 4 * mmax * imid * 2) * T::BYTES * nfields_per_k;
             let max_tile = compute_tile_size(per_field_bytes, nt);
 
@@ -1579,6 +2024,7 @@ impl ReducedEngine {
                         .for_each(do_grad_odd);
                 }
 
+                // Raw output pointers are used so that the parallel per-field loop can write disjoint fields.
                 let au_ptr = out_au[start * self.npoints..(start + tile) * self.npoints].as_mut_ptr() as usize;
                 let av_ptr = out_av[start * self.npoints..(start + tile) * self.npoints].as_mut_ptr() as usize;
                 let bu_ptr = out_bu
@@ -1588,6 +2034,9 @@ impl ReducedEngine {
                     .as_deref_mut()
                     .map(|sl| sl[start * self.npoints..(start + tile) * self.npoints].as_mut_ptr() as usize);
 
+                // Per field (a or b): build the north and south ring spectra `U_m`, `V_m` from the parity sums
+                // and run the inverse real FFT of each ring directly into the output buffers.
+                // Fortran: `u_cos`, `u_sin`, `v_cos`, `v_sin` (and `_s` for south) fed to `hrfftb`.
                 let do_grad_c2r = |ek: usize| {
                     let is_b = ek >= tile;
                     let tk = if is_b { ek - tile } else { ek };
@@ -1620,6 +2069,7 @@ impl ReducedEngine {
                         u_s[..nfreq].fill(T::complex_zero());
                         v_s[..nfreq].fill(T::complex_zero());
 
+                        // `m = 0`: `U_0 = 0` and `V_0 = -dP / R` is real (Fortran `v_cos(0, k) = -sum_dp_real * inv_r`).
                         {
                             let dpe_0 = sdp_e[j * cols + 2 * ek];
                             let dpo_0 = sdp_o[j * cols + 2 * ek];
@@ -1627,6 +2077,9 @@ impl ReducedEngine {
                             v_s[0] = Complex::new(-t_inv_r * (dpo_0 - dpe_0), T::ZERO);
                         }
 
+                        // `m >= 1`: `U_m = i * m / (R sin theta) * P`, `V_m = -dP / R`
+                        // (Fortran `u_cos = -m_grad_scale * sum_p_imag`, `u_sin = -m_grad_scale * sum_p_real`,
+                        // `v_cos = -dp_grad_scale * sum_dp_real`, `v_sin = dp_grad_scale * sum_dp_imag`).
                         for m in 1..=mlimit {
                             let pe_idx = m * imid_stride + j * cols + 2 * ek;
                             let po_idx = m * imm1_stride + j * cols + 2 * ek;
@@ -1656,6 +2109,7 @@ impl ReducedEngine {
                             v_s[m] = Complex::new(-t_inv_r * dp_s_re, -t_inv_r * dp_s_im);
                         }
 
+                        // The Nyquist coefficient of a real signal is real.
                         if row_nlon % 2 == 0 {
                             let nyq = row_nlon / 2;
                             u_n[nyq].im = T::ZERO;
@@ -1687,6 +2141,8 @@ impl ReducedEngine {
                         }
                     }
 
+                    // Odd `nlat`: the equatorial ring only has the even `P` sum and the odd `dP` sum, and `U`, `V`
+                    // are written straight to the single equatorial row.
                     if is_odd_nlat {
                         let j = imid - 1;
                         let row_nlon = self.pl[j];
@@ -1740,6 +2196,8 @@ impl ReducedEngine {
             }
         } else {
             // Non-symmetric fallback
+            // This branch is the Fortran algorithm for non-symmetric `pl`: a direct `P` and `dP/dtheta` sum per
+            // ring and `m` (with `2 * m <= pl(j)`), then one inverse FFT per ring.
             let nlat = self.nlat;
             let run_one = |spec: &ndarray::ArrayView2<'_, Complex<T>>, u_out: &mut [T], v_out: &mut [T]| {
                 u_out[..nt * self.npoints]
@@ -1800,6 +2258,8 @@ impl ReducedEngine {
                                     dp_re += c.re.to_f64() * dp;
                                     dp_im += c.im.to_f64() * dp;
                                 }
+                                // Fortran: `m == 0` writes only `v_cos(0) = -sum_dp_real * inv_r`; `m > 0` writes the full
+                                // `u` and `v` coefficients.
                                 if m == 0 {
                                     v_c[0] = Complex::new(T::from_real(-inv_r * dp_re), T::ZERO);
                                 } else {
@@ -1836,6 +2296,14 @@ impl ReducedEngine {
     }
 }
 
+/// Matrix product restricted to ring pairs `j0..stride`.
+///
+/// Computes `dst (nrows x ncols) (=|+=) p_blk[:, j0..] * rhs[j0.., :]`, where `p_blk` is the
+/// row-major `(nrows, stride)` parity block of one wavenumber `m` and `rhs` is `(stride, ncols)`.
+/// Rows before `j0` belong to rings with `2 * m > pl[j]` and carry no wavenumber `m`.
+/// `accum` selects replace or accumulate.
+///
+/// No direct Fortran counterpart (it replaces the Fortran loop that starts at `first_pair_for_m(m)`).
 fn gemm_subcols<T: FaerGemmFloat>(
     dst: &mut [T],
     nrows: usize,
@@ -1849,6 +2317,17 @@ fn gemm_subcols<T: FaerGemmFloat>(
     T::faer_gemm_subcols(dst, nrows, ncols, accum, p_blk, stride, rhs, j0);
 }
 
+/// Copy the per-`m` product results of `getvrtdivspec` into the output spectra.
+///
+/// - `spec_buf_m`: products for all `m`, `spec_m_stride` elements per `m`, `cols` columns per row.
+/// - `is_even`: even (`n - m` even, `nm = m_base + 2 * r`) or odd (`nm = m_base + 1 + 2 * r`) degrees.
+/// - `ptable`: parity table giving the number of degree rows for each `m`.
+/// - `mode`, `want_div`, `want_vrt`: select what is written; for `VrtDiv` a row holds
+///   `(div_re, div_im, vrt_re, vrt_im)` per field, otherwise `(re, im)`.
+/// - `start`, `tile`: first field of the tile and number of fields.
+///
+/// The imaginary part is forced to zero for `m = 0`. No direct Fortran counterpart; the Fortran
+/// writes `divspec(nm, k)` and `vrtspec(nm, k)` directly from `div_*_acc(n)` and `vrt_*_acc(n)`.
 #[allow(clippy::too_many_arguments)]
 fn scatter_reduced_vec<T: crate::precision::ShtFloat>(
     spec_buf_m: &[T],
@@ -1867,6 +2346,8 @@ fn scatter_reduced_vec<T: crate::precision::ShtFloat>(
     mut out_div: Option<&mut [Complex<T>]>,
     mut out_vrt: Option<&mut [Complex<T>]>,
 ) {
+    // Offset of the first degree of this parity inside the `m` block: 0 for `n = m, m + 2, ...`,
+    // 1 for `n = m + 1, m + 3, ...`.
     let r_off = if is_even { 0 } else { 1 };
     for m in 0..mmax {
         let nrows = ptable.rows_for_m(m, ntrunc);
@@ -1913,11 +2394,17 @@ fn scatter_reduced_vec<T: crate::precision::ShtFloat>(
     }
 }
 
+/// Selects the per-precision Legendre basis and FFT plan cache stored in `ReducedEngine`.
+///
+/// Implemented for `f32` and `f64`, so one engine serves both precisions. No direct Fortran
+/// counterpart (the Fortran code uses single precision `real` arrays with `double precision`
+/// accumulators).
 pub trait TypedReducedBasis: FaerGemmFloat {
     fn get_basis(engine: &ReducedEngine) -> &ReducedRowBasis<Self>;
     fn get_fft(engine: &ReducedEngine) -> &FftCache<Self>;
 }
 
+/// Single-precision basis and FFT plans (built lazily from `pl`).
 impl TypedReducedBasis for f32 {
     #[inline]
     fn get_basis(engine: &ReducedEngine) -> &ReducedRowBasis<Self> {
@@ -1932,6 +2419,7 @@ impl TypedReducedBasis for f32 {
     }
 }
 
+/// Double-precision basis and FFT plans (built lazily from `pl`).
 impl TypedReducedBasis for f64 {
     #[inline]
     fn get_basis(engine: &ReducedEngine) -> &ReducedRowBasis<Self> {

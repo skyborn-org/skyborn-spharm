@@ -1,4 +1,38 @@
 //! Equatorial-parity-split scalar and vector harmonic tables for regular and Gaussian grids.
+//!
+//! Derived from NCAR SPHEREPACK 3.2 (J. Adams and P. Swarztrauber), see LICENSE.spherepack.
+//!
+//! # Background (SPHEREPACK `shaes`/`shses`/`vhaes`/`vhses`/`shags`/`vhags`, `sphcom.f`)
+//!
+//! SPHEREPACK precomputes, in its initialisation routines, the colatitude-dependent
+//! functions used by spherical harmonic analysis and synthesis: the normalised associated
+//! Legendre functions $\bar P_n^m(\theta_i)$ (scalar synthesis), the vector functions
+//! $\bar V_n^m$ and $\bar W_n^m$ (vector synthesis), and the analysis kernels $Z_n^m$,
+//! $Z_{v,n}^m$, $Z_{w,n}^m$. Because the grid is symmetric about the equator, each function is
+//! either even or odd about the equator, so only the northern hemisphere (`imid = (nlat+1)/2`
+//! colatitudes) is stored. Even functions need `imid` values, odd functions need
+//! `imm1 = nlat/2` values (the equator row is dropped when `nlat` is odd, since odd functions vanish there).
+//!
+//! Scalar functions $\bar P_n^m$ and $Z_n^m$ are even about the equator when `n - m` is even and odd
+//! when `n - m` is odd. For the vector functions, $\bar V_n^m$ is odd when `n - m` is even (even when
+//! `n - m` is odd), while $\bar W_n^m$ is even when `n - m` is even, as encoded in [`VectorTables`].
+//!
+//! Analysis kernels: on a Gaussian grid $Z = w_i \bar P$ (the Gaussian weights `wts(i)` of `gaqd`
+//! multiply `pbar` in the Fortran analysis sums of `shags`); on a regular grid they
+//! are the Clenshaw-Curtis quadrature functions of `regular_weights.rs`.
+//!
+//! Regular-grid `ndo` rules (`shaes.f`, `shses.f`, `vhaes.f`, `vhses.f`): the Fortran loops over `np1` stop at
+//! `ndo` (scalar) or `ndo1`/`ndo2` (vector), which drops the degree `n = nlat - 1` for the parity
+//! combinations in which its function would vanish on every grid node. The Rust tables
+//! store zero rows for these entries (see [`ParityTable`] pre-zeroing).
+//!
+//! # Differences from Fortran
+//!
+//! - Tables are stored per `m` as parity-split row blocks (`ParityTable`), not as the Fortran
+//!   `pmn(imid, ...)`/`zin(imid, nlat, 3)` work arrays packed in `wshaes`, `wvhaes`, ...
+//! - No workspace/`wsave` arrays and no `lsave`/`lwork` sizes or `ierror` returns: construction
+//!   returns `Result` and tables are initialised lazily and once (`OnceLock`).
+//! - `f64` is used internally; stored values are converted to the table scalar type `T`.
 
 use std::f64::consts::PI;
 use std::sync::OnceLock;
@@ -8,14 +42,24 @@ use crate::regular_weights::{compute_regular_scalar_z, compute_regular_vector_zw
 use crate::SpharmFloat;
 
 /// Grid type supported by `ParityHarmonicTables`.
+///
+/// Fortran: the `gridtype` choice made by the user between the `*es`/`*ec` (equally spaced,
+/// poles included) and `*gs`/`*gc` (Gaussian) SPHEREPACK families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridType {
+    /// Equally spaced colatitudes including both poles, $\theta_i = (i-1)\pi/(nlat-1)$ (SPHEREPACK `shaes`, `shses`, `vhaes`, `vhses`).
     Regular,
+    /// Gaussian colatitudes and weights from `gaqd` (SPHEREPACK `shags`, `shsgs`, `vhags`, `vhsgs`).
     Gaussian,
 }
 
 impl GridType {
     /// Parse `"regular"` or `"gaussian"` (case-insensitive).
+    ///
+    /// Errors: any other string yields `Err` with the message
+    /// `gridtype must be 'regular' or 'gaussian', got '...'`.
+    ///
+    /// No direct Fortran counterpart (the Fortran API selects the grid by choosing the routine).
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "regular" => Ok(Self::Regular),
@@ -31,17 +75,37 @@ impl GridType {
 /// contain the degrees of one parity (`n - m` even or `n - m` odd) in ascending `n` order,
 /// with contiguous northern-hemisphere latitude index `i in 0..stride` (`stride = imid` for
 /// equatorially even functions and `stride = imm1` for equatorially odd functions).
+///
+/// Row `r = row_offsets[m] + (n - m) / 2` holds the degree `n` of the given parity, i.e. `n = m`,
+/// `m + 2`, ... for `is_even_nm` and `n = m + 1`, `m + 3`, ... otherwise, up to `n = nlat - 1`.
+/// Entries not written by the builders (for example the SPHEREPACK `ndo` exclusions) stay zero.
+///
+/// Difference from Fortran: SPHEREPACK stores a full `(imid, nlat, 3)` slab per `m` (and a packed
+/// triangular index `mn = m*(nlat-1) - m*(m-1)/2 + np1`); here each `m` is a dense,
+/// parity-split, C-order block with 0-based `n`.
 #[derive(Debug, Clone)]
 pub struct ParityTable<T> {
+    /// Flat storage of all blocks, `row_offsets[mmax] * stride` values.
     pub data: Vec<T>,
+    /// `row_offsets[m]` is the first row of wavenumber `m`; length `mmax + 1` (last entry = total rows).
     pub row_offsets: Vec<usize>,
+    /// Number of latitude values per row (`imid` for equatorially even rows, `imm1` for odd rows).
     pub stride: usize,
+    /// Number of zonal wavenumbers `m = 0..mmax` stored.
     pub mmax: usize,
+    /// Number of colatitudes of the full grid.
     pub nlat: usize,
+    /// `true` if the rows hold `n - m` even, `false` for `n - m` odd.
     pub is_even_nm: bool,
 }
 
 impl<T> ParityTable<T> {
+    /// Allocate a zero-filled table, counting rows per `m` (degrees `n = m..nlat-1` of one parity).
+    ///
+    /// For `is_even_nm` the count is `(n_max - m)/2 + 1` and otherwise `(n_max - m - 1)/2 + 1`
+    /// (or 0 when `n_max <= m`), with `n_max = nlat - 1`.
+    ///
+    /// No direct Fortran counterpart (replaces the packed SPHEREPACK work-array layout).
     pub(crate) fn allocate_zero(
         nlat: usize,
         mmax: usize,
@@ -81,6 +145,10 @@ impl<T> ParityTable<T> {
     }
 
     /// Number of degree rows for wavenumber `m` up to truncation `ntrunc`.
+    ///
+    /// Counts only degrees `n <= min(ntrunc, nlat - 1)` of the table's parity; returns 0 when
+    /// `m >= mmax` or `ntrunc < m`. No direct Fortran counterpart (Fortran loops `np1 = mp1, ndo, 2`
+    /// directly with `ndo` as the truncation).
     #[inline]
     pub fn rows_for_m(&self, m: usize, ntrunc: usize) -> usize {
         if m >= self.mmax || ntrunc < m {
@@ -99,6 +167,8 @@ impl<T> ParityTable<T> {
     }
 
     /// Row-major `(rows_for_m(m, ntrunc), stride)` slice for wavenumber `m` truncated at `ntrunc`.
+    ///
+    /// Returns an empty slice if there are no rows or `stride == 0`. No direct Fortran counterpart.
     #[inline]
     pub fn block_for_m(&self, m: usize, ntrunc: usize) -> &[T] {
         let nrows = self.rows_for_m(m, ntrunc);
@@ -109,6 +179,10 @@ impl<T> ParityTable<T> {
         &self.data[start..start + nrows * self.stride]
     }
 
+    /// Store `values[..stride]` as the row for `(m, n)`, converting from `f64` to `T`.
+    ///
+    /// Requires `n - m` to match the table parity (debug-asserted). Local row is `(n - m)/2`.
+    /// No direct Fortran counterpart.
     #[inline]
     pub(crate) fn set_row_from_f64(&mut self, m: usize, n: usize, values: &[f64])
     where
@@ -129,6 +203,10 @@ impl<T> ParityTable<T> {
 }
 
 /// Parity-split scalar synthesis ($\bar{P}_n^m$) and analysis ($Z_n^m$) tables.
+///
+/// Analysis tables $Z_n^m$ come from Gaussian weights times $\bar P_n^m$ on Gaussian grids and
+/// from the Clenshaw-Curtis functions on regular grids.
+/// Fortran: shaes.f / shses.f / shags.f (scalar tables and `wshaes`, `wshses`, `wshags` packing).
 #[derive(Debug, Clone)]
 pub struct ScalarTables<T> {
     /// Synthesis $\bar{P}_n^m(\theta_i)$ for $n - m$ even (`stride = imid`).
@@ -150,21 +228,55 @@ pub struct ScalarTables<T> {
 /// - `w_odd`, `zw_odd` (`n - m` odd): equatorially ODD (`stride = imm1`).
 ///
 /// SPHEREPACK `ndo1`/`ndo2` rule (`n = nlat - 1` with `m` even) and `n = 0` are pre-zeroed.
+///
+/// Fortran: the `ndo1`/`ndo2` limits in vhaes.f / vhses.f (also vhags.f): with
+/// `mlat = nlat mod 2`, `ndo1 = nlat - 1` if `mlat != 0` (else `nlat`) and `ndo2 = nlat - 1` if
+/// `mlat == 0` (else `nlat`). The `zv_*`/`zw_*` tables are the vector analysis kernels
+/// (Clenshaw-Curtis on regular grids, Gaussian weights times $V$, $W$ on Gaussian grids).
 #[derive(Debug, Clone)]
 pub struct VectorTables<T> {
+    /// $\bar V_n^m$ for $n - m$ even: equatorially odd (`stride = imm1`).
     pub v_even: ParityTable<T>,
+    /// $\bar V_n^m$ for $n - m$ odd: equatorially even (`stride = imid`).
     pub v_odd: ParityTable<T>,
+    /// $\bar W_n^m$ for $n - m$ even: equatorially even (`stride = imid`).
     pub w_even: ParityTable<T>,
+    /// $\bar W_n^m$ for $n - m$ odd: equatorially odd (`stride = imm1`).
     pub w_odd: ParityTable<T>,
+    /// Analysis kernel $Z_{v,n}^m$ for $n - m$ even (`stride = imm1`).
     pub zv_even: ParityTable<T>,
+    /// Analysis kernel $Z_{v,n}^m$ for $n - m$ odd (`stride = imid`).
     pub zv_odd: ParityTable<T>,
+    /// Analysis kernel $Z_{w,n}^m$ for $n - m$ even (`stride = imid`).
     pub zw_even: ParityTable<T>,
+    /// Analysis kernel $Z_{w,n}^m$ for $n - m$ odd (`stride = imm1`).
     pub zw_odd: ParityTable<T>,
 }
 
 /// Compute northern-hemisphere $\bar{P}_n^m(\theta_i)$ in `f64` via `dnlfk`/`dnlft` ($m=0,1$)
 /// and Schwarztrauber's recurrence ($m \ge 2$), calling `emit(n, m, &pbar_nh)` in ascending `n` order.
 /// Keeps only 3 `n`-levels of size `(max_m + 1) * imid` in temporary memory.
+///
+/// Parameters:
+/// - `nlat`: number of colatitudes (not needed by the recurrence, kept for symmetry with callers).
+/// - `max_n`: largest degree streamed (`n = 0..=max_n`).
+/// - `max_m_plus_1`: number of orders requested (`m = 0..min(max_m_plus_1, max_n + 1)`).
+/// - `colats_nh`: northern-hemisphere colatitudes in radians (`imid` values).
+/// - `emit(n, m_lim, cur, prev)`: `cur` holds $\bar P_n^m$ for `m = 0..=m_lim`, row-major
+///   `(m, i)` with `i < imid`, `m_lim = min(n, m_cap - 1)`; `prev` holds $\bar P_{n-1}^m$ for
+///   `m = 0..=min(n-1, m_cap-1)` (empty for `n = 0`). Slices are only valid during the call.
+///
+/// Recurrences (SPHEREPACK normalisation, $\bar P_0^0 = \sqrt{1/2}$): seeds at `n = 0, 1`,
+/// then for `n >= 2` the three-term Bonnet recurrence in `n` for `m = 0, 1` and the
+/// Schwarztrauber recurrence $\bar P_n^m = a\,\bar P_{n-2}^{m-2} + b\,\bar P_{n-2}^m - c\,\bar P_n^{m-2}$
+/// for `m >= 2` (same coefficient structure as Fortran `abel`, `bbel`, `cbel`).
+///
+/// Fortran: sphcom.f / legin1 (Gaussian grids) and alin1 / rabcp1 (regular grids)
+///
+/// Difference from Fortran: Fortran advances in `m` for fixed `n` columns (`pmn(np1,i,km0..km2)`,
+/// permuting `km0, km1, km2`); here the loop is over `n` with a 3-level ring over `n`, `n-1`,
+/// `n-2`, and `m = 0, 1` also use recurrences in `n` instead of Fortran's separate `p0n`, `p1n` tables.
+/// All arithmetic is `f64`.
 pub(crate) fn stream_pbar_nh<F>(
     nlat: usize,
     max_n: usize,
@@ -174,9 +286,11 @@ pub(crate) fn stream_pbar_nh<F>(
 ) where
     F: FnMut(usize, usize, &[f64], &[f64]),
 {
+    // imid = number of northern-hemisphere colatitudes, from `0` (north pole) to the equator.
     let imid = colats_nh.len();
     let m_cap = max_m_plus_1.min(max_n + 1);
     let stride = m_cap * imid;
+    // Ring buffer of three n-levels (n, n-1, n-2), each holding m_cap rows of imid values.
     let mut ring = vec![0.0_f64; 3 * stride];
     let mut sin_th = Vec::with_capacity(imid);
     let mut cos_th = Vec::with_capacity(imid);
@@ -187,6 +301,7 @@ pub(crate) fn stream_pbar_nh<F>(
     }
 
     // n = 0
+    // n = 0: Pbar_0^0 = sqrt(1/2) on every node (SPHEREPACK normalisation).
     let ssqr2 = 0.5_f64.sqrt();
     if m_cap >= 1 {
         ring[..imid].fill(ssqr2);
@@ -198,6 +313,7 @@ pub(crate) fn stream_pbar_nh<F>(
 
     // n = 1
     {
+        // n = 1: Pbar_1^0 = sqrt(3/2) cos(th) and Pbar_1^1 = sqrt(3/4) sin(th).
         let cur_off = stride;
         let m_lim = 1usize.min(m_cap - 1);
         let s32 = 1.5_f64.sqrt();
@@ -216,6 +332,7 @@ pub(crate) fn stream_pbar_nh<F>(
         emit(1, m_lim, cur_slice, &ring[..imid]);
     }
 
+    // n >= 2: level n is built from levels n-1 (nm1_off) and n-2 (nm2_off); ring offsets rotate modulo 3.
     for n in 2..=max_n {
         let nm2_off = ((n + 1) % 3) * stride;
         let nm1_off = ((n + 2) % 3) * stride;
@@ -227,6 +344,7 @@ pub(crate) fn stream_pbar_nh<F>(
 
         // m = 0 via 3-term Bonnet recurrence
         {
+            // Pbar_n^0 = a0 cos(th) Pbar_{n-1}^0 - b0 Pbar_{n-2}^0, a0 = sqrt((2n+1)(2n-1))/n, b0 = ((n-1)/n) sqrt((2n+1)/(2n-3)).
             let a0 = (c_num * (2.0 * nf - 1.0)).sqrt() / nf;
             let b0 = ((nf - 1.0) / nf) * (c_num / (2.0 * nf - 3.0)).sqrt();
             for i in 0..imid {
@@ -237,6 +355,7 @@ pub(crate) fn stream_pbar_nh<F>(
 
         // m = 1 via 3-term Bonnet recurrence
         if m_lim >= 1 {
+            // Pbar_n^1 = a1 cos(th) Pbar_{n-1}^1 - b1 Pbar_{n-2}^1, a1 = sqrt((2n+1)(2n-1)/((n-1)(n+1))), b1 = sqrt((2n+1) n (n-2)/((2n-3)(n-1)(n+1))) (0 for n < 3).
             let denom1 = (nf - 1.0) * (nf + 1.0);
             let a1 = (c_num * (2.0 * nf - 1.0) / denom1).sqrt();
             let b1 = if n >= 3 {
@@ -252,6 +371,7 @@ pub(crate) fn stream_pbar_nh<F>(
 
         // m >= 2 via Schwarztrauber recurrence
         if m_lim >= 2 {
+            // Pbar_n^m = abel Pbar_{n-2}^{m-2} + bbel Pbar_{n-2}^m - cbel Pbar_n^{m-2}, with c_num = 2n+1, c_den = 2n-3 and d1 = (m+n-1)(m+n).
             let c_den = 2.0 * nf - 3.0;
             for m in 2..=m_lim {
                 let mf = m as f64;
@@ -259,6 +379,7 @@ pub(crate) fn stream_pbar_nh<F>(
                 let abel = (c_num * (mf + nf - 2.0) * (mf + nf - 3.0) / (c_den * d1)).sqrt();
                 let cbel = (((nf - mf + 1.0) * (nf - mf + 2.0)) / d1).sqrt();
 
+                // The bbel term needs Pbar_{n-2}^m, which exists only for m <= n-2 (m < n-1).
                 if m < n - 1 {
                     let bbel = (c_num * (nf - mf - 1.0) * (nf - mf) / (c_den * d1)).sqrt();
                     for i in 0..imid {
@@ -275,6 +396,7 @@ pub(crate) fn stream_pbar_nh<F>(
             }
         }
 
+        // `nlat` is not needed by the recurrence; this binding only silences the unused-parameter warning.
         let _ = nlat;
         let cur_slice = &ring[cur_off..cur_off + (m_lim + 1) * imid];
         let prev_m = (n - 1).min(m_cap - 1);
@@ -284,14 +406,25 @@ pub(crate) fn stream_pbar_nh<F>(
 }
 
 /// Equatorial-parity-split spherical harmonic tables with lazy scalar/vector initialization.
+///
+/// Fortran: the combined initialisation of SPHEREPACK `shaesi`/`shsesi` (scalar), `vhaesi`/`vhsesi`
+/// (vector) and `shagsi`/`vhagsi` (Gaussian), minus the FFT work arrays. Scalar and vector tables
+/// are built independently on first use.
 #[derive(Debug)]
 pub struct ParityHarmonicTables<T: SpharmFloat> {
+    /// Number of colatitudes (`nlat >= 3`).
     pub nlat: usize,
+    /// Number of longitudes (`nlon >= 1`).
     pub nlon: usize,
+    /// `(nlat + 1)/2`: number of northern-hemisphere colatitudes including the equator for odd `nlat`.
     pub imid: usize,
+    /// `nlat / 2`: number of latitudes strictly north of the equator (rows of equatorially odd functions).
     pub imm1: usize,
+    /// Scalar zonal wavenumber count, `min(nlat, nlon/2 + 1)` (Fortran `mmax` in shaes/shses).
     pub mmax_scalar: usize,
+    /// Vector zonal wavenumber count, `min(nlat, (nlon + 1)/2)` (Fortran `mmax` in vhaes/vhses).
     pub mmax_vector: usize,
+    /// Regular (equally spaced, poles included) or Gaussian grid.
     pub gridtype: GridType,
     /// Northern-hemisphere colatitudes in radians (`len = imid`).
     pub colats_nh: Vec<f64>,
@@ -303,6 +436,16 @@ pub struct ParityHarmonicTables<T: SpharmFloat> {
 
 impl<T: SpharmFloat> ParityHarmonicTables<T> {
     /// Construct harmonic table metadata and grid geometry (`gaqd` for Gaussian, uniform colatitudes for Regular).
+    ///
+    /// Errors: `nlat < 3` and `nlon < 1` return `Err` (the Fortran drivers report an invalid
+    /// `nlat` as `ierror = 1` and an invalid `nlon` as `ierror = 2`).
+    ///
+    /// Regular grid: `colats_nh[i] = i * pi/(nlat-1)` for `i = 0..imid` (Fortran
+    /// `dt = pi/(nlat-1)`, `th = (i-1)*dt`). Gaussian grid: the first `imid` colatitudes and weights
+    /// of the `gaqd` nodes. `imid = (nlat+1)/2`, `imm1 = nlat/2`, `mmax_scalar = min(nlat, nlon/2+1)`,
+    /// `mmax_vector = min(nlat, (nlon+1)/2)`.
+    ///
+    /// Fortran: shaes.f (`shaesi`), vhaes.f (`vhaesi`), gaqd.f (Gaussian nodes and weights)
     pub fn new(nlat: usize, nlon: usize, gridtype: GridType) -> Result<Self, String> {
         if nlat < 3 {
             return Err(format!("nlat must be >= 3, got {nlat}"));
@@ -346,25 +489,42 @@ impl<T: SpharmFloat> ParityHarmonicTables<T> {
     }
 
     /// Return (lazily initializing if needed) the parity-split scalar tables.
+    ///
+    /// Difference from Fortran: tables are built once on first use (`OnceLock`), not eagerly in
+    /// `shaesi`/`shsesi`/`shagsi`.
     pub fn ensure_scalar(&self) -> &ScalarTables<T> {
         self.scalar.get_or_init(|| self.build_scalar())
     }
 
     /// Return (lazily initializing if needed) the parity-split vector tables.
+    ///
+    /// Difference from Fortran: built once on first use (`OnceLock`), not eagerly in
+    /// `vhaesi`/`vhsesi`/`vhagsi`.
     pub fn ensure_vector(&self) -> &VectorTables<T> {
         self.vector.get_or_init(|| self.build_vector())
     }
 
     /// Return already-initialized scalar tables if present.
+    ///
+    /// No direct Fortran counterpart (non-initialising accessor).
     pub fn scalar_if_init(&self) -> Option<&ScalarTables<T>> {
         self.scalar.get()
     }
 
     /// Return already-initialized vector tables if present.
+    ///
+    /// No direct Fortran counterpart (non-initialising accessor).
     pub fn vector_if_init(&self) -> Option<&VectorTables<T>> {
         self.vector.get()
     }
 
+    /// Build all scalar tables $\bar P_n^m$ and $Z_n^m$ for `m < mmax_scalar`.
+    ///
+    /// $\bar P_n^m$ is streamed with `stream_pbar_nh` and split by `n - m` parity. Gaussian grids
+    /// set $Z = w_i \bar P_n^m$ with the northern-hemisphere Gaussian weights; regular grids fill
+    /// $Z$ from `compute_regular_scalar_z`. Rows excluded by the regular-grid `ndo` rule stay zero.
+    ///
+    /// Fortran: shaes.f / shaesi (via `sea1`, `ses1` in sphcom.f), shags.f / shagsi
     fn build_scalar(&self) -> ScalarTables<T> {
         let mut p_even = ParityTable::allocate_zero(self.nlat, self.mmax_scalar, self.imid, true);
         let mut p_odd = ParityTable::allocate_zero(self.nlat, self.mmax_scalar, self.imm1, false);
@@ -382,14 +542,19 @@ impl<T: SpharmFloat> ParityHarmonicTables<T> {
             &self.colats_nh,
             |n, m_lim, cur_p, _prev_p| {
                 for m in 0..=m_lim {
+                    // Parity split: n - m even rows go to the even tables (stride imid); n - m odd rows go to
+                    // the odd tables (stride imm1, the equator row is dropped).
                     // SPHEREPACK regular-grid ndo rule (shaes/shses):
                     // at n == nlat - 1 with m odd, sin((nlat-1)*theta) vanishes on all nodes.
+                    // Fortran shaes.f / shses.f: ndo = nlat for the first loop when nlat is odd (nlat - 1 when
+                    // even), and the opposite for the second loop. Both loops skip np1 = nlat (n = nlat - 1) for odd m.
                     if !is_gaussian && n == self.nlat - 1 && m % 2 == 1 {
                         continue;
                     }
                     let row = &cur_p[m * imid..(m + 1) * imid];
                     if (n - m) % 2 == 0 {
                         p_even.set_row_from_f64(m, n, row);
+                        // Gaussian analysis: Z = wts(i) * Pbar (weights multiply pbar in the Fortran analysis sums).
                         if is_gaussian {
                             for i in 0..imid {
                                 weighted_buf[i] = row[i] * self.weights_nh[i];
@@ -409,6 +574,8 @@ impl<T: SpharmFloat> ParityHarmonicTables<T> {
             },
         );
 
+        // Regular grid: Z comes from the Clenshaw-Curtis functions (Fortran zfin1/zfini1);
+        // the same ndo rule (n = nlat - 1 with odd m) is skipped.
         if !is_gaussian {
             compute_regular_scalar_z(self.nlat, self.mmax_scalar, &self.colats_nh, |m, n, row| {
                 if n == self.nlat - 1 && m % 2 == 1 {
@@ -430,6 +597,23 @@ impl<T: SpharmFloat> ParityHarmonicTables<T> {
         }
     }
 
+    /// Build all vector tables $\bar V_n^m$, $\bar W_n^m$, $Z_{v,n}^m$, $Z_{w,n}^m$ for `m < mmax_vector`.
+    ///
+    /// From the streamed $\bar P_n^m$ (in `stream_pbar_nh`, requested up to `mmax + 1` orders):
+    /// - $\bar V_n^0 = -\bar P_n^1$;
+    /// - $\bar V_n^m = [\sqrt{(n+m)(n-m+1)}\,\bar P_n^{m-1} - \sqrt{(n-m)(n+m+1)}\,\bar P_n^{m+1}] / \sqrt{4n(n+1)}$ for `1 <= m < n`;
+    /// - $\bar V_n^n = \bar P_n^{n-1} / \sqrt{2(n+1)}$;
+    /// - $\bar W_n^m = d\,[\sqrt{(n+m)(n+m-1)}\,\bar P_{n-1}^{m-1} + \sqrt{(n-m)(n-m-1)}\,\bar P_{n-1}^{m+1}]$,
+    ///   $d = \sqrt{(2n+1)/(4n(n+1)(2n-1))}$, the second term absent for `m >= n - 1`.
+    ///
+    /// Rows `n = 0` and, on regular grids, `n = nlat - 1` with even `m` (the `ndo1`/`ndo2` rule) stay zero.
+    /// Gaussian grids weight each row by the Gaussian weights to get $Z_v$, $Z_w$; regular grids use
+    /// `compute_regular_vector_zw`.
+    ///
+    /// Fortran: sphcom.f / vbinit, wbinit, vbin, wbin (V, W), zvinit, zwinit (Z_v, Z_w); vhaes.f, vhses.f, vhags.f
+    ///
+    /// Difference from Fortran: V and W are formed directly from $\bar P$ here; the Fortran init
+    /// routines build them from their own trigonometric-series/recurrence tables.
     fn build_vector(&self) -> VectorTables<T> {
         let mmax = self.mmax_vector;
         let mut v_even = ParityTable::allocate_zero(self.nlat, mmax, self.imm1, true);
@@ -447,6 +631,8 @@ impl<T: SpharmFloat> ParityHarmonicTables<T> {
         let nlat = self.nlat;
         let is_gaussian = self.gridtype == GridType::Gaussian;
 
+        // Gaussian grids: Z_v = wts * V and Z_w = wts * W, row by row; regular grids use the
+        // Clenshaw-Curtis functions computed in compute_regular_vector_zw below.
         // We need P_{n}^{m+1} for V_n^m (m < n) and P_{n-1}^{m+1} for W_n^m (m < n-1),
         // so request up to mmax + 1 (clamped to nlat).
         let p_m_cap = (mmax + 1).min(nlat);
@@ -473,6 +659,8 @@ impl<T: SpharmFloat> ParityHarmonicTables<T> {
                     for i in 0..imid {
                         v_buf[i] = -p1[i];
                     }
+                    // Fortran vhaes.f / vhses.f / vhags.f: with mlat = nlat mod 2, ndo1 = nlat - 1 if mlat != 0 and
+                    // ndo2 = nlat - 1 if mlat == 0 (else nlat); the np1 loops stop there, so degree n = nlat - 1 is skipped for even m.
                     // SPHEREPACK ndo1/ndo2 rule: n == nlat - 1 with m even is zeroed
                     if !(n == nlat - 1) {
                         if n % 2 == 0 {
@@ -496,6 +684,7 @@ impl<T: SpharmFloat> ParityHarmonicTables<T> {
                 }
 
                 // 1 <= m <= min(n - 1, mmax - 1) for V_n^m
+                // V_n^m = (sqrt((n+m)(n-m+1)) P_n^{m-1} - sqrt((n-m)(n+m+1)) P_n^{m+1}) / sqrt(4 n (n+1)).
                 let dcf_v = (4.0 * nf * (nf + 1.0)).sqrt();
                 let m_hi_v = (n - 1).min(mmax - 1);
                 for m in 1..=m_hi_v {
@@ -546,6 +735,7 @@ impl<T: SpharmFloat> ParityHarmonicTables<T> {
                 }
 
                 // 1 <= m <= min(n, mmax - 1) for W_n^m
+                // W_n^m = dcf_w (sqrt((n+m)(n+m-1)) P_{n-1}^{m-1} + sqrt((n-m)(n-m-1)) P_{n-1}^{m+1}); the second term is absent for m >= n-1.
                 let dcf_w = ((2.0 * nf + 1.0) / (4.0 * nf * (nf + 1.0) * (2.0 * nf - 1.0))).sqrt();
                 for m in 1..=max_m_vec {
                     if n == nlat - 1 && m % 2 == 0 {
@@ -587,12 +777,14 @@ impl<T: SpharmFloat> ParityHarmonicTables<T> {
             },
         );
 
+        // Regular grid: Z_v, Z_w from the Clenshaw-Curtis functions.
         if !is_gaussian {
             compute_regular_vector_zw(
                 nlat,
                 mmax,
                 &self.colats_nh,
                 |m, n, row| {
+                    // Zero rows: n = 0, and n = nlat - 1 with even m (ndo1/ndo2 rule).
                     if n == 0 || (n == nlat - 1 && m % 2 == 0) {
                         return;
                     }
@@ -603,6 +795,7 @@ impl<T: SpharmFloat> ParityHarmonicTables<T> {
                     }
                 },
                 |m, n, row| {
+                    // Zero rows: n = 0, m = 0 (W vanishes), and n = nlat - 1 with even m (ndo1/ndo2 rule).
                     if n == 0 || m == 0 || (n == nlat - 1 && m % 2 == 0) {
                         return;
                     }

@@ -5,6 +5,24 @@
 //! normalization:
 //! $$\int_0^\pi (\bar{P}_n^m(\theta))^2 \sin\theta\, d\theta = 1, \quad \bar{P}_0^0 = \frac{\sqrt{2}}{2}.$$
 //! Output coefficient and basis tables support `T = f32` and `T = f64` via [`SpharmFloat`].
+//!
+//! Derived from NCAR SPHEREPACK 3.2 (J. Adams and P. Swarztrauber), see LICENSE.spherepack.
+//!
+//! Correspondence of the modules with the Fortran reference sources (`fortran_ref/src/fortran`
+//! for the fixed-form SPHEREPACK files, `fortran_ref/src` for the Fortran 90 files):
+//!
+//! | Rust module | Fortran source |
+//! |---|---|
+//! | `gauss` | `gaqd.f` (`gaqd`, `cpdp`, `tpdp`) |
+//! | `geodesic` | `ihgeod.f` (`ihgeod`, `ctos`, `stoc`) |
+//! | `legendre` | `alf.f` (`alfk`, `lfim`, `lfin`, `lfpt`), `sphcom.f` (`dnlfk`, `dnlft`), `getlegfunc.f` |
+//! | `reduced` | `reduced_gaussian_scalar.f90` (Legendre basis and derivative basis parts) |
+//! | `regular_weights`, `tables` | see the documentation of these modules |
+//!
+//! Differences that apply to the whole crate: 0-based indexing, `f64` internal precision (the
+//! Fortran routines mostly use single precision `real`), no workspace arrays (`wsave`, `lsave`,
+//! `work`, `wlfim`), `Result<_, String>` instead of the Fortran `ierror` status code, and no
+//! `hrfft` (the longitude FFT is not part of this crate).
 
 pub mod gauss;
 pub mod geodesic;
@@ -22,12 +40,23 @@ pub use reduced::{ReducedBasisData, ReducedRowBasis};
 pub use tables::{GridType, ParityHarmonicTables, ParityTable, ScalarTables, VectorTables};
 
 /// Sealed floating-point storage trait implemented for `f32` and `f64`.
+///
+/// No direct Fortran counterpart. Describes the storage precision of the output tables: the kernels
+/// compute in `f64` and results are narrowed with [`SpharmFloat::from_f64`] only when stored.
+///
+/// Difference from Fortran: the Fortran tables are typically single precision `real` (kernels such as
+/// `gaqd` and `dnlfk` are double precision internally); here the choice between `f32` and `f64` storage
+/// is a type parameter.
 pub trait SpharmFloat: Copy + Send + Sync + Debug + 'static {
+    /// The additive identity of the storage type, used to zero-initialize tables.
     const ZERO: Self;
+    /// Converts an `f64` result into the storage type (a rounding cast for `f32`).
     fn from_f64(v: f64) -> Self;
+    /// Widens a stored value back to `f64` (exact for both implementations).
     fn to_f64(self) -> f64;
 }
 
+/// Single precision storage, the precision of the Fortran `real` tables; narrowing uses `as f32`.
 impl SpharmFloat for f32 {
     const ZERO: Self = 0.0;
     #[inline]
@@ -40,6 +69,7 @@ impl SpharmFloat for f32 {
     }
 }
 
+/// Double precision storage, lossless.
 impl SpharmFloat for f64 {
     const ZERO: Self = 0.0;
     #[inline]
@@ -57,6 +87,10 @@ mod tests {
     use super::*;
     use std::f64::consts::{FRAC_PI_2, PI};
 
+    /// For several `nlat`, checks the lengths, that the weights sum to 2 and are positive, that the
+    /// latitudes are antisymmetric about the equator and strictly decreasing, that the weights are
+    /// symmetric, that odd `nlat` has an equatorial latitude of 0, and that `nlat = 0` is an error
+    /// (Fortran `gaqd`: `ierror = 1`).
     #[test]
     fn test_gaussian_lats_wts_properties() {
         for &nlat in &[1usize, 2, 3, 4, 16, 37, 64, 128] {
@@ -82,6 +116,9 @@ mod tests {
         assert!(gaussian_lats_wts(0).is_err());
     }
 
+    /// Checks closed forms of $\bar{P}_0^0$, $\bar{P}_1^0$ and $\bar{P}_1^1$ at one colatitude, the
+    /// discrete orthonormality of $\bar{P}_n^m$ over Gaussian quadrature (`nlat = 32`, `ntrunc = 15`),
+    /// finite values at the pole, and that `ntrunc >= nlat` is rejected.
     #[test]
     fn test_legendre_pbar_normalization_and_exact_values() {
         let theta = 0.7_f64;
@@ -125,6 +162,7 @@ mod tests {
         assert!(get_legendre_pbar(5, 5, FRAC_PI_2).is_err());
     }
 
+    /// Checks that `m < 2` is rejected, that the point count is `10 * (m - 1)^2 + 2` (the `ihgeod` header), that the first two points are the poles, and that all values are finite and in range.
     #[test]
     fn test_icosahedral_geodesic_counts_and_poles() {
         assert!(icosahedral_geodesic(1).is_err());
@@ -140,6 +178,7 @@ mod tests {
         }
     }
 
+    /// Checks that the scalar analysis tables are orthonormal against the synthesis tables on Regular and Gaussian grids, for even and odd `nlat`. On Regular grids `n = nlat - 1` is excluded for odd `m` (the `ndo` rule of the SPHEREPACK Fortran drivers).
     #[test]
     fn test_regular_and_gaussian_scalar_orthogonality_and_poles() {
         for &(nlat, nlon, grid) in &[
@@ -202,6 +241,7 @@ mod tests {
         }
     }
 
+    /// Checks that the vector tables are finite everywhere (no polar division by zero on Regular grids) and that the vector spherical harmonics are orthonormal, including the `ndo` limit on the maximum degree for even and odd `m`.
     #[test]
     fn test_regular_and_gaussian_vector_tables_orthogonality_and_ndo_rule() {
         for &(nlat, nlon, grid) in &[
@@ -293,6 +333,7 @@ mod tests {
         }
     }
 
+    /// Checks the reduced Gaussian row bookkeeping (`npoints`, `symmetric_pl`, `max_nlon`), that the `f32` basis and derivative basis are finite, and that the stored $d\bar{P}_n^m/d\theta$ equals $\sqrt{n(n+1)}$ times the vector basis $V_n^m$ of the full Gaussian tables.
     #[test]
     fn test_reduced_row_basis_and_f32_tables() {
         let pl = [16usize, 20, 24, 28, 32, 28, 24, 20, 16];
@@ -343,6 +384,7 @@ mod tests {
         }
     }
 
+    /// Checks that `legendre_pbar` is finite at the south pole $\theta = \pi$ and that $\bar{P}_0^0 = \sqrt{2}/2$, $\bar{P}_1^0 = -\sqrt{3/2}$ there.
     #[test]
     fn test_theta_pi_colatitude_bounds() {
         let p = legendre_pbar(4, PI).unwrap();
